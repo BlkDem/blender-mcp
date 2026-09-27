@@ -25,6 +25,7 @@ class Action(StrEnum):
 
     # reads
     GET_SCENE = "get_scene"
+    GET_OBJECTS = "get_objects"
     GET_OBJECT = "get_object"
     PING = "ping"
     # mutations

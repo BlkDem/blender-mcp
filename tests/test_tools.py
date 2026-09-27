@@ -29,23 +29,23 @@ def error_payload(message: str) -> str:
 
 
 async def test_get_scene(ctx: FakeContext, bridge: FakeBridge) -> None:
-    bridge.results[Action.GET_SCENE] = {"scene": "Scene", "objects_total": 2}
+    bridge.results[Action.GET_SCENE] = {"scene": "Scene", "objects_count": 2}
     result = await scene.get_scene(ctx)
 
     assert bridge.calls == [(Action.GET_SCENE, {})]
-    assert result == {"scene": "Scene", "objects_total": 2}
+    assert result == {"scene": "Scene", "objects_count": 2}
 
 
 async def test_get_scene_reports_not_connected(ctx: FakeContext, bridge: FakeBridge) -> None:
     bridge.raise_for[Action.GET_SCENE] = BlenderMCPError(
-        "No Blender instance is connected", code=ErrorCode.NOT_CONNECTED
+        "No Blender instance is connected", code=ErrorCode.BLENDER_NOT_CONNECTED
     )
     with pytest.raises(ToolError) as excinfo:
         await scene.get_scene(ctx)
 
     payload = error_payload(excinfo.value.args[0])
     assert payload["success"] is False
-    assert payload["error"]["code"] == "NOT_CONNECTED"
+    assert payload["error"]["code"] == "BLENDER_NOT_CONNECTED"
 
 
 async def test_get_object(ctx: FakeContext, bridge: FakeBridge) -> None:
@@ -244,7 +244,7 @@ async def test_execute_python_is_refused_when_disabled(ctx: FakeContext, bridge:
     with pytest.raises(ToolError) as excinfo:
         await python.execute_python(ctx, code="import bpy")
     payload = error_payload(excinfo.value.args[0])
-    assert payload["error"]["code"] == "PERMISSION_DENIED"
+    assert payload["error"]["code"] == "PYTHON_EXECUTION_DISABLED"
     assert "ALLOW_PYTHON_EXECUTION" in payload["error"]["message"]
     assert bridge.calls == []
 
@@ -259,20 +259,20 @@ async def test_execute_python_rejects_dangerous_code(python_ctx: FakeContext, br
 
 
 async def test_the_permission_gate_runs_before_the_screener(ctx: FakeContext, bridge: FakeBridge) -> None:
-    """Disabled means disabled: dangerous code reports PERMISSION_DENIED, not VALIDATION_ERROR."""
+    """Disabled means disabled: dangerous code reports PYTHON_EXECUTION_DISABLED, not VALIDATION_ERROR."""
     with pytest.raises(ToolError) as excinfo:
         await python.execute_python(ctx, code="import os")
-    assert error_payload(excinfo.value.args[0])["error"]["code"] == "PERMISSION_DENIED"
+    assert error_payload(excinfo.value.args[0])["error"]["code"] == "PYTHON_EXECUTION_DISABLED"
     assert bridge.calls == []
 
 
 async def test_execute_python_surfaces_blender_failures(python_ctx: FakeContext, bridge: FakeBridge) -> None:
     bridge.raise_for[Action.EXECUTE_PYTHON] = BlenderMCPError(
-        "NameError: name 'foo' is not defined", code=ErrorCode.EXECUTION_ERROR
+        "NameError: name 'foo' is not defined", code=ErrorCode.PYTHON_EXECUTION_ERROR
     )
     with pytest.raises(ToolError) as excinfo:
         await python.execute_python(python_ctx, code="result = foo")
-    assert error_payload(excinfo.value.args[0])["error"]["code"] == "EXECUTION_ERROR"
+    assert error_payload(excinfo.value.args[0])["error"]["code"] == "PYTHON_EXECUTION_ERROR"
 
 
 # --- transactions -----------------------------------------------------------
@@ -346,3 +346,111 @@ def test_descriptions_state_the_units_the_model_must_use() -> None:
     assert "OBJECT_ALREADY_EXISTS" in objects.CREATE_OBJECT_DESCRIPTION
     assert "OBJECT_NOT_FOUND" in objects.DELETE_OBJECT_DESCRIPTION
     assert "ALLOW_PYTHON_EXECUTION" in python.EXECUTE_PYTHON_DESCRIPTION
+
+
+# --- get_objects --------------------------------------------------------------
+
+
+async def test_get_objects_defaults(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await scene.get_objects(ctx)
+    assert bridge.calls == [(Action.GET_OBJECTS, {"limit": 50, "offset": 0})]
+
+
+async def test_get_objects_passes_filters_through(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await scene.get_objects(ctx, type="mesh", collection="Props", name_contains="ta", limit=10, offset=5)
+    action, params = bridge.calls[0]
+    assert action is Action.GET_OBJECTS
+    assert params == {
+        "limit": 10,
+        "offset": 5,
+        "type": "MESH",
+        "collection": "Props",
+        "name_contains": "ta",
+    }
+
+
+@pytest.mark.parametrize(
+    "given,sent",
+    [(100000, 500), (0, 1), (-3, 1), ("nonsense", 50), (None, 50)],
+)
+async def test_get_objects_clamps_the_page_size(
+    ctx: FakeContext, bridge: FakeBridge, given: object, sent: int
+) -> None:
+    await scene.get_objects(ctx, limit=given)  # type: ignore[arg-type]
+    assert bridge.calls[0][1]["limit"] == sent
+
+
+async def test_get_objects_clamps_a_negative_offset(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await scene.get_objects(ctx, offset=-10)
+    assert bridge.calls[0][1]["offset"] == 0
+
+
+async def test_get_objects_returns_the_page_unchanged(ctx: FakeContext, bridge: FakeBridge) -> None:
+    page = {"objects": [{"name": "A"}], "count": 1, "total": 9, "offset": 0, "limit": 1, "truncated": True}
+    bridge.results[Action.GET_OBJECTS] = page
+    assert await scene.get_objects(ctx) == page
+
+
+# --- create_object type normalisation -----------------------------------------
+
+
+@pytest.mark.parametrize("given", ["CUBE", "Cube", "cube"])
+async def test_create_object_accepts_any_case(ctx: FakeContext, bridge: FakeBridge, given: str) -> None:
+    await objects.create_object(ctx, type=given, name="Box")  # type: ignore[arg-type]
+    assert bridge.calls[0][1]["type"] == "cube"
+
+
+async def test_create_object_still_rejects_an_unknown_type(ctx: FakeContext, bridge: FakeBridge) -> None:
+    with pytest.raises(ToolError) as excinfo:
+        await objects.create_object(ctx, type="dodecahedron", name="D12")  # type: ignore[arg-type]
+    assert error_payload(excinfo.value.args[0])["error"]["code"] == "INVALID_OBJECT_TYPE"
+
+
+# --- update_object: rename and material ---------------------------------------
+
+
+async def test_update_object_can_rename(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.UPDATE_OBJECT] = {"success": True, "renamed_to": "Box -> Crate"}
+    result = await objects.update_object(ctx, name="Box", new_name="Crate")
+    assert bridge.calls[0][1] == {"name": "Box", "new_name": "Crate"}
+    assert result["renamed_to"] == "Box -> Crate"
+
+
+async def test_update_object_rejects_a_blank_new_name(ctx: FakeContext, bridge: FakeBridge) -> None:
+    with pytest.raises(ToolError):
+        await objects.update_object(ctx, name="Box", new_name="  ")
+    assert bridge.calls == []
+
+
+async def test_update_object_can_assign_a_material(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await objects.update_object(ctx, name="Box", material="Wood")
+    assert bridge.calls[0][1] == {"name": "Box", "material": "Wood"}
+
+
+async def test_update_object_forwards_a_material_colour(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await objects.update_object(ctx, name="Box", material="Red", material_color=[0.8, 0.0, 0.0, 1.0])
+    assert bridge.calls[0][1]["material_color"] == [0.8, 0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("colour", [[0.8, 0.0], [2.0, 0.0, 0.0], [-1, 0, 0], ["r", "g", "b"]])
+async def test_update_object_rejects_a_bad_colour(ctx: FakeContext, bridge: FakeBridge, colour: list) -> None:
+    with pytest.raises(ToolError) as excinfo:
+        await objects.update_object(ctx, name="Box", material="Red", material_color=colour)
+    assert error_payload(excinfo.value.args[0])["error"]["code"] == "INVALID_PARAMETER"
+    assert bridge.calls == []
+
+
+async def test_update_object_without_a_material_ignores_a_lone_colour(
+    ctx: FakeContext, bridge: FakeBridge
+) -> None:
+    with pytest.raises(ToolError) as excinfo:
+        await objects.update_object(ctx, name="Box", material_color=[1.0, 0.0, 0.0])
+    assert error_payload(excinfo.value.args[0])["error"]["code"] == "INVALID_PARAMETER"
+
+
+async def test_update_object_error_message_lists_the_new_fields(ctx: FakeContext, bridge: FakeBridge) -> None:
+    with pytest.raises(ToolError) as excinfo:
+        await objects.update_object(ctx, name="Box")
+    message = error_payload(excinfo.value.args[0])["error"]["message"]
+    assert "new_name" in message
+    assert "material" in message

@@ -7,7 +7,7 @@ using the add-on's own client.
 
 What this proves: tool registration and schemas, request/response framing, error
 propagation with intact codes, resource reads, transaction bookkeeping, and that
-a disconnected Blender surfaces as ``NOT_CONNECTED`` rather than a hang. What it
+a disconnected Blender surfaces as ``BLENDER_NOT_CONNECTED`` rather than a hang. What it
 does not prove: anything about ``bpy`` itself.
 """
 
@@ -123,6 +123,7 @@ async def test_the_tool_list_is_what_the_brief_asks_for() -> None:
         names = {tool.name for tool in (await env.session.list_tools()).tools}
     assert names == {
         "blender.get_scene",
+        "blender.get_objects",
         "blender.get_object",
         "blender.create_object",
         "blender.update_object",
@@ -171,6 +172,9 @@ async def test_update_object_parameters_are_all_optional() -> None:
         "scale",
         "dimensions",
         "visibility",
+        "new_name",
+        "material",
+        "material_color",
     }
 
 
@@ -202,12 +206,12 @@ async def test_calls_fail_cleanly_when_blender_is_not_connected() -> None:
     async with mcp_server() as env:
         result = await env.session.call_tool("blender.get_scene", {})
         assert result.is_error
-        assert error_of(result)["code"] == "NOT_CONNECTED"
+        assert error_of(result)["code"] == "BLENDER_NOT_CONNECTED"
 
 
 async def test_resources_report_not_connected() -> None:
     async with mcp_server() as env:
-        with pytest.raises(BaseException, match="NOT_CONNECTED"):
+        with pytest.raises(BaseException, match="BLENDER_NOT_CONNECTED"):
             await env.session.read_resource("blender://scene")
 
 
@@ -221,7 +225,7 @@ async def test_the_acceptance_walkthrough() -> None:
 
         scene = payload_of(await session.call_tool("blender.get_scene", {}))
         assert scene["scene"] == "Scene"
-        assert scene["objects_total"] == 0
+        assert scene["objects_count"] == 0
         assert scene["collections"] == ["Collection"]
         assert scene["cameras"] == ["Camera"]
 
@@ -259,7 +263,7 @@ async def test_the_acceptance_walkthrough() -> None:
             "message": "Object 'Box' already exists",
         }
         # No silent "Box.001" was created.
-        assert payload_of(await session.call_tool("blender.get_scene", {}))["objects_total"] == 1
+        assert payload_of(await session.call_tool("blender.get_scene", {}))["objects_count"] == 1
 
         assert payload_of(await session.call_tool("blender.delete_object", {"name": "Box"})) == {
             "success": True,
@@ -285,7 +289,7 @@ async def test_execute_python_is_refused_when_disabled() -> None:
     async with mcp_server(allow_python_execution=False) as env:
         await attach(env)
         result = await env.session.call_tool("blender.execute_python", {"code": "import bpy"})
-        assert error_of(result)["code"] == "PERMISSION_DENIED"
+        assert error_of(result)["code"] == "PYTHON_EXECUTION_DISABLED"
         env.blender.close()  # type: ignore[union-attr]
 
 
@@ -345,7 +349,7 @@ async def test_scene_resource_returns_compact_json() -> None:
         read = await env.session.read_resource("blender://scene")
     payload = json.loads(read.contents[0].text)
     assert payload["scene"] == "Scene"
-    assert payload["objects_total"] == 1
+    assert payload["objects_count"] == 1
     assert payload["objects"][0]["name"] == "Box"
     assert "materials" not in payload["objects"][0]
 
@@ -380,3 +384,31 @@ async def test_many_requests_in_a_row_stay_correlated() -> None:
     assert len(results) == 20
     assert sorted(results) == [(index, f"C{index}") for index in range(20)]
     assert len(env.blender.objects) == 20  # type: ignore[union-attr]
+
+
+async def test_a_registered_call_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """The log is wired in by register(), not by each tool: prove it end to end."""
+    import logging
+    import re
+
+    caplog.set_level(logging.INFO, logger="server.mcp.support")
+    async with connected() as env:
+        await env.session.call_tool("blender.get_scene", {})
+        await env.session.call_tool("blender.get_object", {"name": "Ghost"})
+
+    lines = [record.getMessage() for record in caplog.records if record.getMessage().startswith("mcp ")]
+    pattern = re.compile(
+        r"tool=(?P<tool>\S+) request=(?P<request>\S+) duration_ms=[\d.]+ "
+        r"success=(?P<success>true|false)(?: error=(?P<error>\S+))?"
+    )
+    parsed = [pattern.search(line) for line in lines]
+    # attach() probes with get_scene until the double is up, so only the last
+    # get_scene and the get_object are ours.
+    mine = [match for match in parsed if match and match["tool"] != "blender.get_scene"] + [
+        match for match in parsed if match and match["tool"] == "blender.get_scene"
+    ][-1:]
+    by_tool = {match["tool"]: match for match in mine if match}
+    assert set(by_tool) == {"blender.get_scene", "blender.get_object"}, lines
+    assert by_tool["blender.get_scene"]["success"] == "true"
+    assert by_tool["blender.get_object"]["success"] == "false"
+    assert by_tool["blender.get_object"]["error"] == "OBJECT_NOT_FOUND"

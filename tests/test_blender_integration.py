@@ -203,7 +203,7 @@ def test_non_mesh_objects_do_not_break_the_listing() -> None:
 def test_get_scene_stays_compact() -> None:
     create(type="cube", name="Box")
     scene = operators.get_scene({})
-    assert scene["objects_total"] == 1
+    assert scene["objects_count"] == 1
     assert set(scene["objects"][0]) == {
         "name",
         "type",
@@ -211,9 +211,28 @@ def test_get_scene_stays_compact() -> None:
         "rotation",
         "scale",
         "dimensions",
+        "visible",
     }
     # No mesh data, whatever the caller asks for.
-    assert "verts" not in json_text(scene)
+    assert "vertices" not in json_text(scene)
+
+
+def test_get_scene_matches_the_documented_shape() -> None:
+    create(type="cube", name="Box")
+    scene = operators.get_scene({})
+    for field in (
+        "scene",
+        "objects_count",
+        "frame",
+        "active_object",
+        "active_camera",
+        "render_engine",
+        "collections",
+        "objects",
+    ):
+        assert field in scene, f"{field} missing from the scene payload"
+    assert scene["active_object"] == "Box"
+    assert scene["render"]["engines"]
 
 
 def test_get_scene_can_include_detail_and_drop_objects() -> None:
@@ -280,7 +299,7 @@ def test_execute_python_without_a_result_still_succeeds() -> None:
 def test_execute_python_reports_a_failure_with_a_traceback() -> None:
     with pytest.raises(ActionError) as excinfo:
         executor.execute_user_code("result = undefined_name")
-    assert excinfo.value.code == "EXECUTION_ERROR"
+    assert excinfo.value.code == "PYTHON_EXECUTION_ERROR"
     assert "NameError" in excinfo.value.message
     assert "undefined_name" in str(excinfo.value.details["traceback"])
 
@@ -453,11 +472,11 @@ def test_render_rejects_an_unknown_engine(lit_scene: Any) -> None:
     assert lit_scene.render.engine == "CYCLES"
 
 
-def test_render_without_a_camera_reports_a_blender_error(lit_scene: Any) -> None:
+def test_render_without_a_camera_reports_a_blender_operation_error(lit_scene: Any) -> None:
     lit_scene.camera = None
     with pytest.raises(ActionError) as excinfo:
         operators.render({"engine": "CYCLES", "resolution_x": 16, "resolution_y": 16})
-    assert excinfo.value.code in {"BLENDER_ERROR", "INVALID_PARAMETER"}
+    assert excinfo.value.code in {"BLENDER_OPERATION_FAILED", "INVALID_PARAMETER"}
 
 
 # --- helpers -----------------------------------------------------------------
@@ -465,3 +484,175 @@ def test_render_without_a_camera_reports_a_blender_error(lit_scene: Any) -> None
 
 def json_text(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
+
+
+# --- get_objects -------------------------------------------------------------
+
+
+def test_get_objects_lists_everything_by_default() -> None:
+    for name in ("Alpha", "Beta", "Gamma"):
+        create(type="cube", name=name)
+    page = operators.get_objects({})
+    assert page["total"] == 3
+    assert [obj["name"] for obj in page["objects"]] == ["Alpha", "Beta", "Gamma"]
+    assert page["truncated"] is False
+
+
+def test_get_objects_pages_and_says_so() -> None:
+    for index in range(5):
+        create(type="cube", name=f"Obj{index}")
+    first = operators.get_objects({"limit": 2})
+    assert [obj["name"] for obj in first["objects"]] == ["Obj0", "Obj1"]
+    assert first["total"] == 5
+    assert first["truncated"] is True
+
+    second = operators.get_objects({"limit": 2, "offset": 2})
+    assert [obj["name"] for obj in second["objects"]] == ["Obj2", "Obj3"]
+    last = operators.get_objects({"limit": 2, "offset": 4})
+    assert [obj["name"] for obj in last["objects"]] == ["Obj4"]
+    assert last["truncated"] is False
+
+
+def test_get_objects_filters_by_name_and_type() -> None:
+    create(type="cube", name="TableTop")
+    create(type="sphere", name="TableBall")
+    create(type="cylinder", name="LegFL")
+    assert [obj["name"] for obj in operators.get_objects({"name_contains": "table"})["objects"]] == [
+        "TableBall",
+        "TableTop",
+    ]
+    assert operators.get_objects({"type": "MESH"})["total"] == 3
+    assert operators.get_objects({"type": "CAMERA"})["total"] == 0
+
+
+def test_get_objects_ignores_a_filter_that_matches_nothing() -> None:
+    create(type="cube", name="Box")
+    page = operators.get_objects({"name_contains": "nothing-here"})
+    assert page == {
+        "objects": [],
+        "count": 0,
+        "total": 0,
+        "offset": 0,
+        "limit": 50,
+        "truncated": False,
+    }
+
+
+def test_get_objects_caps_the_page_size() -> None:
+    from blender_mcp.operators import MAX_LIST_LIMIT
+
+    assert operators.get_objects({"limit": 100000})["limit"] == MAX_LIST_LIMIT
+    assert operators.get_objects({"limit": 0})["limit"] == 1
+    assert operators.get_objects({"offset": -5})["offset"] == 0
+
+
+def test_get_objects_returns_summaries_not_details() -> None:
+    create(type="cube", name="Box")
+    summary = operators.get_objects({})["objects"][0]
+    assert "materials" not in summary
+    assert "modifiers" not in summary
+
+
+# --- rename and material ------------------------------------------------------
+
+
+def test_update_renames_an_object() -> None:
+    create(type="cube", name="Box")
+    result = operators.update_object({"name": "Box", "new_name": "Crate"})
+    assert result["renamed_to"] == "Box -> Crate"
+    assert result["object"]["name"] == "Crate"
+    assert "Crate" in bpy.data.objects and "Box" not in bpy.data.objects
+
+
+def test_renaming_to_the_same_name_is_a_no_op() -> None:
+    create(type="cube", name="Box")
+    result = operators.update_object({"name": "Box", "new_name": "Box"})
+    assert "renamed_to" not in result
+    assert "Box" in bpy.data.objects
+
+
+def test_renaming_onto_a_taken_name_is_refused() -> None:
+    create(type="cube", name="Box")
+    create(type="cube", name="Crate")
+    with pytest.raises(ActionError) as excinfo:
+        operators.update_object({"name": "Box", "new_name": "Crate"})
+    assert excinfo.value.code == "OBJECT_ALREADY_EXISTS"
+    assert "Box" in bpy.data.objects and "Crate" in bpy.data.objects
+
+
+def test_update_assigns_an_existing_material() -> None:
+    create(type="cube", name="Box")
+    bpy.data.materials.new("Wood")
+    result = operators.update_object({"name": "Box", "material": "Wood"})
+    assert result["material"] == "Wood"
+    assert result["material_created"] is False
+    assert result["object"]["materials"] == ["Wood"]
+
+
+def test_update_creates_a_missing_material_with_the_given_colour() -> None:
+    create(type="cube", name="Box")
+    result = operators.update_object({"name": "Box", "material": "Red", "material_color": [0.8, 0.05, 0.05]})
+    assert result["material_created"] is True
+    material = bpy.data.materials["Red"]
+    assert tuple(round(value, 3) for value in material.diffuse_color[:3]) == (0.8, 0.05, 0.05)
+    # The shader must agree with the viewport colour, or a render comes out grey.
+    bsdf = material.node_tree.nodes["Principled BSDF"]
+    assert tuple(round(value, 3) for value in bsdf.inputs["Base Color"].default_value[:3]) == (
+        0.8,
+        0.05,
+        0.05,
+    )
+
+
+def test_update_material_replaces_the_previous_slots() -> None:
+    create(type="cube", name="Box")
+    operators.update_object({"name": "Box", "material": "First"})
+    result = operators.update_object({"name": "Box", "material": "Second"})
+    assert result["object"]["materials"] == ["Second"]
+
+
+def test_a_material_cannot_be_assigned_to_a_camera() -> None:
+    camera = bpy.data.objects.new("Cam", bpy.data.cameras.new("CamData"))
+    bpy.context.scene.collection.objects.link(camera)
+    with pytest.raises(ActionError) as excinfo:
+        operators.update_object({"name": "Cam", "material": "Wood"})
+    assert excinfo.value.code == "INVALID_PARAMETER"
+
+
+# --- rotation and the active object ------------------------------------------
+
+
+def test_a_new_object_becomes_the_active_one() -> None:
+    create(type="cube", name="Box")
+    assert operators.get_scene({})["active_object"] == "Box"
+    create(type="sphere", name="Ball")
+    assert operators.get_scene({})["active_object"] == "Ball"
+
+
+def test_get_object_reports_mesh_statistics() -> None:
+    create(type="cube", name="Box")
+    detail = operators.get_object({"name": "Box"})
+    assert detail["vertices"] == 8
+    assert detail["edges"] == 12
+    assert detail["polygons"] == 6
+    assert detail["loops"] == 24
+
+
+def test_mesh_statistics_are_absent_for_non_meshes() -> None:
+    camera = bpy.data.objects.new("Cam", bpy.data.cameras.new("CamData"))
+    bpy.context.scene.collection.objects.link(camera)
+    assert "vertices" not in operators.get_object({"name": "Cam"})
+
+
+def test_summary_visibility_follows_the_hide_flags() -> None:
+    create(type="cube", name="Box")
+    assert operators.get_objects({})["objects"][0]["visible"] is True
+    operators.update_object({"name": "Box", "visibility": False})
+    assert operators.get_objects({})["objects"][0]["visible"] is False
+
+
+@pytest.mark.parametrize("given", ["CUBE", "Cube", "cube"])
+def test_the_addon_also_accepts_any_case(given: str) -> None:
+    """Both entry points to the bridge normalise, so a direct protocol client
+    gets the same answer as one going through the MCP tool."""
+    assert create(type=given, name=f"Case{given}")["name"] == f"Case{given}"

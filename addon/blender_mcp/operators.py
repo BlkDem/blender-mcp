@@ -30,6 +30,10 @@ _LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_TYPES: tuple[str, ...] = ("cube", "sphere", "cylinder", "cone", "plane", "torus")
 
+#: Hard cap on one ``get_objects`` page. A scene with thousands of objects must
+#: not be able to fill an LLM context, whatever limit it asks for.
+MAX_LIST_LIMIT = 500
+
 #: Fallback operators, used only if a bmesh primitive cannot be built.
 #: ``bpy.ops`` needs a live window context, which the main-thread timer has in
 #: the GUI but not under ``blender --background``; bmesh is the primary path for
@@ -106,7 +110,11 @@ def _collection_names(obj: bpy.types.Object) -> list[str]:
 
 
 def _object_summary(obj: bpy.types.Object) -> dict[str, Any]:
-    """The compact per-object view used by scene listings."""
+    """The compact per-object view used by scene and object listings.
+
+    Deliberately flat and short: this is what an LLM reads to decide what to do
+    next, so it carries the transform and nothing it can look up elsewhere.
+    """
     return {
         "name": obj.name,
         "type": obj.type,
@@ -114,6 +122,36 @@ def _object_summary(obj: bpy.types.Object) -> dict[str, Any]:
         "rotation": to_degrees(obj.rotation_euler),
         "scale": [_round(value) for value in obj.scale],
         "dimensions": [_round(value) for value in obj.dimensions],
+        "visible": _is_visible(obj),
+    }
+
+
+def _is_visible(obj: bpy.types.Object) -> bool:
+    """Viewport visibility, or ``True`` when the view layer cannot answer.
+
+    ``visible_get`` raises for objects outside the current view layer, and one
+    odd object should not turn a whole scene listing into an error.
+    """
+    try:
+        return bool(obj.visible_get())
+    except (RuntimeError, AttributeError):
+        return not obj.hide_viewport
+
+
+def _mesh_statistics(obj: bpy.types.Object) -> dict[str, int] | None:
+    """Vertex and face counts, for deciding whether detail is worth reading.
+
+    Counts only. A model that wants geometry asks for it explicitly through
+    ``execute_python`` rather than having every listing carry it.
+    """
+    mesh = getattr(obj, "data", None)
+    if obj.type != "MESH" or mesh is None or not hasattr(mesh, "polygons"):
+        return None
+    return {
+        "vertices": len(mesh.vertices),
+        "edges": len(mesh.edges),
+        "polygons": len(mesh.polygons),
+        "loops": len(mesh.loops),
     }
 
 
@@ -129,6 +167,11 @@ def _object_detail(obj: bpy.types.Object) -> dict[str, Any]:
             "data": obj.data.name if getattr(obj, "data", None) is not None else None,
         }
     )
+    statistics = _mesh_statistics(obj)
+    if statistics is not None:
+        # Flat, because that is how a model reads them: "vertices": 1240 next to
+        # "dimensions" rather than buried under a "mesh" key it has to know about.
+        detail.update(statistics)
     return detail
 
 
@@ -169,10 +212,14 @@ def get_scene(params: dict[str, Any] | None = None) -> dict[str, Any]:
     include_details = bool(params.get("include_details"))
     include_objects = bool(params.get("include_objects", True))
 
+    active = bpy.context.view_layer.objects.active if bpy.context.view_layer else None
     payload: dict[str, Any] = {
         "scene": scene.name,
-        "objects_total": len(objects),
-        "frame_current": scene.frame_current,
+        "objects_count": len(objects),
+        "frame": scene.frame_current,
+        "active_object": active.name if active else None,
+        "active_camera": scene.camera.name if scene.camera else None,
+        "render_engine": scene.render.engine,
     }
     if include_objects:
         payload["objects"] = [
@@ -185,13 +232,54 @@ def get_scene(params: dict[str, Any] | None = None) -> dict[str, Any]:
         for obj in objects
         if obj.type == "LIGHT"
     ]
-    payload["active_camera"] = scene.camera.name if scene.camera else None
+    # The engine list and the render size are not part of the required shape, but
+    # a model that is about to render needs them and get_scene is where it looks.
     payload["render"] = {
-        "engine": scene.render.engine,
         "engines": available_engines(scene),
         "resolution": [scene.render.resolution_x, scene.render.resolution_y],
     }
     return payload
+
+
+def get_objects(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """List objects with filters and a page window.
+
+    ``get_scene`` returns the whole scene, which stops being useful somewhere
+    around a few hundred objects. This is the paged view: filter first, then read
+    a slice, and the response always says how much was left behind.
+    """
+    params = params or {}
+    _sync()
+    objects = sorted(bpy.data.objects, key=lambda obj: obj.name)
+
+    wanted_type = params.get("type")
+    if wanted_type:
+        wanted_type = str(wanted_type).upper()
+        objects = [obj for obj in objects if obj.type == wanted_type]
+
+    collection = params.get("collection")
+    if collection:
+        collection = str(collection)
+        objects = [obj for obj in objects if collection in _collection_names(obj)]
+
+    needle = params.get("name_contains")
+    if needle:
+        needle = str(needle).lower()
+        objects = [obj for obj in objects if needle in obj.name.lower()]
+
+    total = len(objects)
+    offset = max(0, int(params.get("offset", 0)))
+    limit = min(max(1, int(params.get("limit", 50))), MAX_LIST_LIMIT)
+    page = objects[offset : offset + limit]
+
+    return {
+        "objects": [_object_summary(obj) for obj in page],
+        "count": len(page),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "truncated": offset + len(page) < total,
+    }
 
 
 #: Engine ids worth probing. Blender renamed EEVEE between 4.x and 5.x, and a
@@ -256,7 +344,10 @@ def ping(params: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def create_object(params: dict[str, Any]) -> dict[str, Any]:
     """Create a primitive mesh object."""
-    object_type = params.get("type")
+    # Case-tolerant, because a model writing "CUBE" should not be told off by a
+    # primitive list. The MCP tool normalises too; doing it here as well keeps the
+    # two entry points to the bridge behaving identically.
+    object_type = str(params.get("type", "")).lower()
     name = params.get("name")
     if object_type not in _PRIMITIVE_OPS:
         raise ActionError(
@@ -280,8 +371,26 @@ def create_object(params: dict[str, Any]) -> dict[str, Any]:
     if params.get("scale") is not None:
         obj.scale = _vector3(params["scale"], "scale")
 
+    _make_active(obj)
     _sync()
     return {"success": True, "object": _object_detail(obj)}
+
+
+def _make_active(obj: Any) -> None:
+    """Select the new object and make it the active one.
+
+    Blender's own primitive operators do this, and ``get_scene`` reports
+    ``active_object``; without it a freshly created object would be invisible to
+    that field and to anything a user does next in the UI.
+    """
+    view_layer = getattr(bpy.context, "view_layer", None)
+    if view_layer is None:  # pragma: no cover - no view layer means no window
+        return
+    try:
+        obj.select_set(True)
+        view_layer.objects.active = obj
+    except RuntimeError:  # pragma: no cover - object not in this view layer
+        _LOGGER.debug("Could not make %s active in this view layer", obj.name)
 
 
 def _target_collection(name: Any) -> Any:
@@ -411,7 +520,7 @@ def _new_primitive_via_operator(object_type: str, name: str, collection: Any) ->
     operator()
     obj = bpy.context.view_layer.objects.active
     if obj is None:  # pragma: no cover - the operator always creates something
-        raise ActionError(protocol.BLENDER_ERROR, f"The {object_type} operator produced no object")
+        raise ActionError(protocol.BLENDER_OPERATION_FAILED, f"The {object_type} operator produced no object")
     obj.name = name
     for current in list(obj.users_collection):
         current.objects.unlink(obj)
@@ -452,8 +561,86 @@ def update_object(params: dict[str, Any]) -> dict[str, Any]:
         obj.hide_viewport = hidden
         obj.hide_render = hidden
 
+    renamed_to = _rename_object(obj, params.get("new_name"))
+    material_result = _assign_material(obj, params)
+
     _sync()
-    return {"success": True, "object": _object_detail(obj)}
+    payload: dict[str, Any] = {"success": True, "object": _object_detail(obj)}
+    if renamed_to is not None:
+        payload["renamed_to"] = renamed_to
+    if material_result is not None:
+        payload.update(material_result)
+    return payload
+
+
+def _rename_object(obj: Any, new_name: Any) -> str | None:
+    """Rename in place, refusing to collide.
+
+    Blender's alternative is a silent ``Cube.001``, which breaks every later
+    reference the model makes by name, so the collision is an error instead.
+    """
+    if new_name is None or not str(new_name).strip():
+        return None
+    new_name = str(new_name)
+    if new_name == obj.name:
+        return None  # idempotent: renaming to the same name is a no-op, not an error
+    existing = bpy.data.objects.get(new_name)
+    if existing is not None and existing is not obj:
+        raise ActionError(
+            protocol.OBJECT_ALREADY_EXISTS, f"Cannot rename '{obj.name}' to '{new_name}': that name is taken"
+        )
+    previous, obj.name = obj.name, new_name
+    return f"{previous} -> {new_name}"
+
+
+def _assign_material(obj: Any, params: dict[str, Any]) -> dict[str, Any] | None:
+    """Assign a material by name, creating it when it does not exist.
+
+    Creating it here rather than failing is what lets a model's loop converge in
+    one call: "make this red" should not need a separate material-creation step
+    before it can be verified. The response says whether it was created, so the
+    model is never guessing.
+    """
+    name = params.get("material")
+    if not name or not str(name).strip():
+        return None
+    if obj.type != "MESH":
+        raise ActionError(
+            protocol.INVALID_PARAMETER,
+            f"Cannot assign a material to a {obj.type} object; only MESH objects have materials",
+        )
+    name = str(name)
+    material = bpy.data.materials.get(name)
+    created = False
+    if material is None:
+        material = bpy.data.materials.new(name)
+        created = True
+        color = params.get("material_color")
+        if isinstance(color, (list, tuple)) and len(color) in (3, 4):
+            _apply_material_colour(material, [float(component) for component in color[:3]])
+
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    return {"material": material.name, "material_created": created}
+
+
+def _apply_material_colour(material: Any, rgb: list[float]) -> None:
+    """Set the viewport colour *and* the shader.
+
+    ``diffuse_color`` alone is the classic mistake: it colours the solid
+    viewport, while the Principled BSDF keeps its default grey, so a render comes
+    out white and the model cannot tell which of the two it is looking at.
+    """
+    rgba = (*rgb[:3], 1.0)
+    material.diffuse_color = rgba
+    if not material.use_nodes:
+        material.use_nodes = True
+    node_tree = material.node_tree
+    bsdf = node_tree.nodes.get("Principled BSDF") if node_tree else None
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = rgba
+    else:  # pragma: no cover - a node tree without a Principled BSDF
+        _LOGGER.warning("Material %s has no Principled BSDF; set its colour by hand", material.name)
 
 
 def delete_object(params: dict[str, Any]) -> dict[str, Any]:
@@ -497,7 +684,7 @@ def render(params: dict[str, Any]) -> dict[str, Any]:
         _restore_render_overrides(scene, overrides)
 
     if error is not None:
-        raise ActionError(protocol.BLENDER_ERROR, f"Render failed: {error}")
+        raise ActionError(protocol.BLENDER_OPERATION_FAILED, f"Render failed: {error}")
 
     return {
         "success": True,
@@ -601,6 +788,7 @@ def execute_python(params: dict[str, Any]) -> dict[str, Any]:
 
 HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     protocol.GET_SCENE: get_scene,
+    protocol.GET_OBJECTS: get_objects,
     protocol.GET_OBJECT: get_object,
     protocol.PING: ping,
     protocol.CREATE_OBJECT: create_object,
@@ -610,7 +798,9 @@ HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     protocol.EXECUTE_PYTHON: execute_python,
 }
 
-READ_ONLY_ACTIONS = frozenset({protocol.GET_SCENE, protocol.GET_OBJECT, protocol.PING})
+READ_ONLY_ACTIONS = frozenset(
+    {protocol.GET_SCENE, protocol.GET_OBJECTS, protocol.GET_OBJECT, protocol.PING}
+)
 
 
 def dispatch(action: str, params: dict[str, Any]) -> dict[str, Any]:

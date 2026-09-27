@@ -42,13 +42,13 @@ def test_request_rejects_unknown_fields() -> None:
 
 
 def test_response_serialization() -> None:
-    response = Response.ok("abc123", {"scene": "Scene", "objects_total": 3})
+    response = Response.ok("abc123", {"scene": "Scene", "objects_count": 3})
     payload = json.loads(response.to_json())
 
     assert payload["id"] == "abc123"
     assert payload["success"] is True
-    assert payload["result"] == {"scene": "Scene", "objects_total": 3}
-    assert response.raise_for_status() == {"scene": "Scene", "objects_total": 3}
+    assert payload["result"] == {"scene": "Scene", "objects_count": 3}
+    assert response.raise_for_status() == {"scene": "Scene", "objects_count": 3}
 
 
 def test_error_response() -> None:
@@ -129,5 +129,5 @@ def test_mutation_classification_covers_every_write_action() -> None:
 
 
 def test_error_info_round_trips() -> None:
-    info = ErrorInfo(code="BLENDER_ERROR", message="boom")
+    info = ErrorInfo(code="BLENDER_OPERATION_FAILED", message="boom")
     assert ErrorInfo.model_validate(info.model_dump()) == info

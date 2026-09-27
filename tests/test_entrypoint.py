@@ -83,7 +83,7 @@ async def test_the_installed_entry_point_serves_mcp_over_stdio(
                 assert created.structured_content["object"]["name"] == "SmokeBox"
 
                 scene = await session.call_tool("blender.get_scene", {})
-                assert scene.structured_content["objects_total"] == 1
+                assert scene.structured_content["objects_count"] == 1
 
                 read_result = await session.read_resource("blender://objects")
                 assert json.loads(read_result.contents[0].text)["objects"][0]["name"] == "SmokeBox"

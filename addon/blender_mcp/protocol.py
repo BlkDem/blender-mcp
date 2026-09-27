@@ -16,6 +16,7 @@ PROTOCOL_VERSION = 1
 
 # --- actions ----------------------------------------------------------------
 GET_SCENE = "get_scene"
+GET_OBJECTS = "get_objects"
 GET_OBJECT = "get_object"
 PING = "ping"
 CREATE_OBJECT = "create_object"
@@ -46,12 +47,12 @@ OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
 OBJECT_ALREADY_EXISTS = "OBJECT_ALREADY_EXISTS"
 INVALID_OBJECT_TYPE = "INVALID_OBJECT_TYPE"
 INVALID_PARAMETER = "INVALID_PARAMETER"
-BLENDER_ERROR = "BLENDER_ERROR"
-EXECUTION_ERROR = "EXECUTION_ERROR"
+BLENDER_OPERATION_FAILED = "BLENDER_OPERATION_FAILED"
+PYTHON_EXECUTION_ERROR = "PYTHON_EXECUTION_ERROR"
 VALIDATION_ERROR = "VALIDATION_ERROR"
 TIMEOUT = "TIMEOUT"
-NOT_CONNECTED = "NOT_CONNECTED"
-PERMISSION_DENIED = "PERMISSION_DENIED"
+BLENDER_NOT_CONNECTED = "BLENDER_NOT_CONNECTED"
+PYTHON_EXECUTION_DISABLED = "PYTHON_EXECUTION_DISABLED"
 CONNECTION_LOST = "CONNECTION_LOST"
 MALFORMED_MESSAGE = "MALFORMED_MESSAGE"
 UNKNOWN_ACTION = "UNKNOWN_ACTION"
@@ -65,12 +66,12 @@ ERROR_CODES = frozenset(
         OBJECT_ALREADY_EXISTS,
         INVALID_OBJECT_TYPE,
         INVALID_PARAMETER,
-        BLENDER_ERROR,
-        EXECUTION_ERROR,
+        BLENDER_OPERATION_FAILED,
+        PYTHON_EXECUTION_ERROR,
         VALIDATION_ERROR,
         TIMEOUT,
-        NOT_CONNECTED,
-        PERMISSION_DENIED,
+        BLENDER_NOT_CONNECTED,
+        PYTHON_EXECUTION_DISABLED,
         CONNECTION_LOST,
         MALFORMED_MESSAGE,
         UNKNOWN_ACTION,
@@ -122,18 +123,23 @@ def encode_error(request_id: str, code: str, message: str, details: dict[str, An
 
 
 def encode_exception(request_id: str, exc: BaseException) -> str:
-    """Serialise any exception as a BLENDER_ERROR envelope.
+    """Serialise any exception as a BLENDER_OPERATION_FAILED envelope.
 
     The traceback stays in Blender's log; the message the AI sees is the
     exception text, which is what actually helps it recover.
     """
     if isinstance(exc, ActionError):
         return encode_error(request_id, exc.code, exc.message, exc.details)
-    return encode_error(request_id, BLENDER_ERROR, f"{type(exc).__name__}: {exc}")
+    return encode_error(request_id, BLENDER_OPERATION_FAILED, f"{type(exc).__name__}: {exc}")
 
 
 def parse_request(raw: str) -> tuple[str, str, dict[str, Any]]:
-    """Validate an inbound frame, returning ``(id, action, params)``."""
+    """Validate an inbound frame, returning ``(id, action, params)``.
+
+    ``method`` is accepted as a synonym for ``action`` so a client written
+    against the other common JSON-RPC-ish spelling interoperates; ``action``
+    wins when both are present, because that is what this project emits.
+    """
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -142,7 +148,7 @@ def parse_request(raw: str) -> tuple[str, str, dict[str, Any]]:
         raise ProtocolError("frame is not a JSON object")
 
     request_id = payload.get("id")
-    action = payload.get("action")
+    action = payload.get("action") or payload.get("method")
     params = payload.get("params", {})
     if not isinstance(request_id, str) or not request_id:
         raise ProtocolError("missing or invalid 'id'")

@@ -80,7 +80,7 @@ def _short_traceback(exc: BaseException) -> list[str]:
 def execute_user_code(code: str) -> dict[str, Any]:
     """Run ``code`` and report ``result``, output or the failure.
 
-    A snippet that raises is an :class:`ActionError` with EXECUTION_ERROR, so the
+    A snippet that raises is an :class:`ActionError` with PYTHON_EXECUTION_ERROR, so the
     model sees the exception type, the message and the tail of the traceback —
     enough to fix the mistake, without shipping Blender's whole stack.
     """
@@ -92,7 +92,7 @@ def execute_user_code(code: str) -> dict[str, Any]:
     except BaseException as exc:  # noqa: BLE001 - model code can raise anything
         logger.warning("execute_python failed: %s", exc)
         raise ActionError(
-            protocol.EXECUTION_ERROR,
+            protocol.PYTHON_EXECUTION_ERROR,
             f"{type(exc).__name__}: {exc}",
             details={"traceback": _short_traceback(exc)},
         ) from exc

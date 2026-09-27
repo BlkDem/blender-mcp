@@ -24,15 +24,32 @@ from server.mcp.support import bridge_of, register, tool_error
 logger = logging.getLogger(__name__)
 
 GET_SCENE_DESCRIPTION = """\
-Return a compact, LLM-sized summary of the active Blender scene: object names,
-types, transforms, dimensions, plus collection / camera / light names.
+Return a compact, LLM-sized summary of the active scene: object names, types,
+transforms and visibility, plus collections, cameras, lights, the active object,
+the render engine and the current frame.
 
-No mesh data is included. Call blender.get_object for one object in detail.\
+Use this first to see what exists. For a scene with many objects use
+blender.get_objects instead: it filters and pages, so one call cannot flood the
+context. No mesh data is included.\
+"""
+
+GET_OBJECTS_DESCRIPTION = """\
+List objects with filters and a page window, for scenes too large for
+blender.get_scene to be useful.
+
+type: object type to keep, e.g. "MESH", "CAMERA", "LIGHT".
+collection: only objects linked to this collection.
+name_contains: case-insensitive substring of the name.
+limit: page size, 1-500, default 50.
+offset: how many matches to skip, default 0.
+
+Returns the page, plus "total" (matches before paging) and "truncated" (true when
+more objects remain) so you know whether to ask for the next page.\
 """
 
 GET_OBJECT_DESCRIPTION = """\
-Return the full detail of a single object: transform, dimensions, collection,
-material names, modifiers, visibility and parent.
+Return the full detail of a single object: transform, dimensions, visibility,
+collection, material names, modifiers, and vertex/edge/polygon counts for meshes.
 
 Fails with OBJECT_NOT_FOUND when the name does not exist.\
 """
@@ -45,6 +62,39 @@ async def get_scene(ctx: Context) -> dict[str, Any]:
     except BlenderMCPError as exc:
         logger.info("blender.get_scene failed: %s", exc)
         raise tool_error(exc) from exc
+
+
+async def get_objects(
+    ctx: Context,
+    type: str | None = None,
+    collection: str | None = None,
+    name_contains: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List objects, filtered and paged."""
+    params: dict[str, Any] = {"limit": _bounded(limit, 1, 500, 50), "offset": max(0, int(offset))}
+    if type:
+        params["type"] = str(type).upper()
+    if collection:
+        params["collection"] = collection
+    if name_contains:
+        params["name_contains"] = name_contains
+
+    try:
+        return await bridge_of(ctx).request(Action.GET_OBJECTS, params)
+    except BlenderMCPError as exc:
+        logger.info("blender.get_objects failed: %s", exc)
+        raise tool_error(exc) from exc
+
+
+def _bounded(value: int, low: int, high: int, default: int) -> int:
+    """Clamp a paging parameter, so a model cannot ask for the whole scene."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(number, low), high)
 
 
 async def get_object(ctx: Context, name: str) -> dict[str, Any]:
@@ -60,4 +110,5 @@ async def get_object(ctx: Context, name: str) -> dict[str, Any]:
 
 def register_tools(server: MCPServer) -> None:
     register(server, get_scene, "blender.get_scene", GET_SCENE_DESCRIPTION)
+    register(server, get_objects, "blender.get_objects", GET_OBJECTS_DESCRIPTION)
     register(server, get_object, "blender.get_object", GET_OBJECT_DESCRIPTION)

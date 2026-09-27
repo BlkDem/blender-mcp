@@ -4,7 +4,7 @@ Two gates, in this order, both in :mod:`server.validation` and
 :mod:`server.config` rather than here:
 
 1. ``ALLOW_PYTHON_EXECUTION`` must be true, otherwise the call is refused with
-   PERMISSION_DENIED before the socket is touched.
+   PYTHON_EXECUTION_DISABLED before the socket is touched.
 2. the code must pass the AST screen in :func:`server.validation.python`.
 
 The code itself is never executed here. It is validated, forwarded, and run by
@@ -40,7 +40,7 @@ code: statements to run. `import bpy`, `import mathutils` and the standard
       otherwise only a summary is returned.
 
       Otherwise, if the server was started with ALLOW_PYTHON_EXECUTION=false,
-      the call is refused with PERMISSION_DENIED without contacting Blender.
+      the call is refused with PYTHON_EXECUTION_DISABLED without contacting Blender.
 
 Example:
     import bpy
@@ -62,7 +62,7 @@ def _require_permission(settings: Settings) -> None:
                 "Python execution is disabled. Set ALLOW_PYTHON_EXECUTION=true in your "
                 "environment (or .env) and restart the MCP server to enable "
                 "blender.execute_python.",
-                code=ErrorCode.PERMISSION_DENIED,
+                code=ErrorCode.PYTHON_EXECUTION_DISABLED,
             )
         )
 

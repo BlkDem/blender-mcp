@@ -91,7 +91,7 @@ class TransactionState:
                 bpy.ops.ed.undo()
             except RuntimeError as exc:  # pragma: no cover - undo stack exhausted
                 raise ActionError(
-                    protocol.BLENDER_ERROR,
+                    protocol.BLENDER_OPERATION_FAILED,
                     f"Undo stopped after {undone} of {recorded} step(s): {exc}",
                 ) from exc
             undone += 1
@@ -169,7 +169,7 @@ class BlenderConnection:
             self._stop.clear()
             self._thread = threading.Thread(target=self._run, name="blender-mcp-connection", daemon=True)
             self._thread.start()
-        self._register_timer()
+        self.start_timer()
         return True
 
     def disconnect(self) -> None:
@@ -182,6 +182,8 @@ class BlenderConnection:
         self._thread = None
         self._close_socket()
         self._set_status("Disconnected")
+        # Ask the pump to retire itself on its next pass rather than unregistering
+        # from here: disconnect() may be called from either thread.
         logger.info("Disconnected from MCP server %s", self.url)
 
     def set_server(self, host: str, port: int) -> None:
@@ -285,21 +287,13 @@ class BlenderConnection:
 
     # --- main thread -------------------------------------------------------
 
-    def _register_timer(self) -> None:
-        """Register the main-thread pump. Must be called from the main thread."""
-        if self._timer_registered:
-            return
-        try:
-            bpy.app.timers.register(self._drain_inbox, first_interval=_TIMER_INTERVAL)
-            self._timer_registered = True
-        except Exception:  # pragma: no cover - interpreter shutdown
-            logger.warning("Could not register the dispatch timer", exc_info=True)
+    def drain(self) -> float | None:
+        """Run every queued action on the calling thread.
 
-    def _drain_inbox(self) -> float | None:
-        """Run queued actions on the main thread.
-
-        Returns the next delay, or ``None`` to let Blender unregister the timer
-        once the connection is gone and the queue is empty.
+        Public because it is the seam a driver needs when Blender has no event
+        loop to run timers: under ``--background`` the timer never fires, so a
+        script calls this directly instead. Returns the delay before the next
+        pass, or ``None`` when there is nothing left to do.
         """
         while True:
             try:
@@ -312,6 +306,29 @@ class BlenderConnection:
             self._timer_registered = False
             return None
         return _TIMER_INTERVAL
+
+    def start_timer(self) -> None:
+        """Register the main-thread pump. Must be called from the main thread."""
+        if self._timer_registered:
+            return
+        try:
+            bpy.app.timers.register(self._tick, first_interval=_TIMER_INTERVAL)
+            self._timer_registered = True
+        except Exception:  # pragma: no cover - interpreter shutdown
+            logger.warning("Could not register the dispatch timer", exc_info=True)
+
+    def stop_timer(self) -> None:
+        """Unregister the pump. Must be called from the main thread."""
+        if not self._timer_registered:
+            return
+        try:
+            bpy.app.timers.unregister(self._tick)
+        except Exception:  # pragma: no cover - already unregistered
+            logger.debug("Dispatch timer was not registered", exc_info=True)
+        self._timer_registered = False
+
+    def _tick(self) -> float | None:
+        return self.drain()
 
     def _execute(self, request_id: str, action: str, params: dict[str, Any]) -> str:
         """Execute one action on the main thread and return the response frame."""

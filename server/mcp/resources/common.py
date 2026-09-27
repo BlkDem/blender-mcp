@@ -19,7 +19,7 @@ async def read_json(bridge: BlenderBridge, action: Action, params: dict[str, Any
 
     A :class:`BlenderMCPError` becomes a :class:`ResourceError` on purpose: the
     SDK forwards an anticipated resource failure's message to the client but
-    replaces a crash with a generic one, and ``NOT_CONNECTED`` is exactly the
+    replaces a crash with a generic one, and ``BLENDER_NOT_CONNECTED`` is exactly the
     kind of thing the client needs to read.
     """
     try:

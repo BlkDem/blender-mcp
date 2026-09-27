@@ -56,7 +56,8 @@ will let the transport change later without touching either side.
 - [Units and conventions](#units-and-conventions)
 - [Error handling](#error-handling)
 - [The bridge protocol](#the-bridge-protocol)
-- [Security: `blender.execute_python`](#security-blenderexecute_python)
+- [Security](#security)
+- [When to use `execute_python`](#when-to-use-execute_python)
 - [Transactions and undo](#transactions-and-undo)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
@@ -323,7 +324,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-259 tests, ~12 s, no Blender required. These cover the protocol, the WebSocket
+295 tests, ~12 s, no Blender required. These cover the protocol, the WebSocket
 transport (driving the add-on's own client against the real server), every tool,
 the policy screen, and a full MCP session over a real socket. See
 [Development](#development) for what each file covers.
@@ -409,15 +410,35 @@ learn:
 * **`Region.active_panel_category` is read-only until the region has been drawn
   with panels in it.** Open the sidebar, redraw, then select the tab.
 
-### 5. The full stack against real Blender, in CI
+### 5. The acceptance scenario
+
+Two scripts, and they check the same things at different levels:
+
+```bash
+# in-process, against a real bpy: the operator layer
+blender --background --python examples/acceptance_check.py
+
+# the whole chain: MCP client -> server -> WebSocket -> add-on -> bpy
+python examples/mcp_acceptance.py --port 8774 \
+    --blender-arg=blender --blender-arg=--background \
+    --blender-arg=--python --blender-arg=examples/blender_attach.py
+```
+
+`acceptance_check.py` prints a PASS/FAIL line per step and exits non-zero on
+failure. `mcp_acceptance.py` does the same over MCP, and additionally asserts the
+tool surface, the resources, the error codes and the transaction bookkeeping.
+Together they are the definition of done for this project: every tool, every
+resource, the idempotency rule, five error paths, a render and an undo group.
+
+### 6. The full stack against real Blender, in CI
 
 `bpy` installed → two more test modules switch themselves on and test the real
 thing, headless:
 
 ```bash
 pip install bpy==4.2.0
-pytest                          # 319 tests: 259 + 60 against real bpy
-BLENDER_MCP_SKIP_BPY=1 pytest   # 259, opt the real-Blender ones back out
+pytest                          # 376 tests: 295 + 81 against real bpy
+BLENDER_MCP_SKIP_BPY=1 pytest   # 295, opt the real-Blender ones back out
 ```
 
 * `tests/test_blender_integration.py` — the operator layer against real `bpy`:
@@ -453,22 +474,118 @@ needs the GUI event loop. The tests call the dispatch function directly instead
 
 ## MCP tools
 
+### Scene
+
 | Tool | Required | Optional | What it does |
 |---|---|---|---|
 | `blender.get_scene` | — | — | Compact summary of the active scene |
-| `blender.get_object` | `name` | — | Full detail of one object |
+| `blender.get_objects` | — | `type`, `collection`, `name_contains`, `limit`, `offset` | Filtered, paged object list |
+
+### Object
+
+| Tool | Required | Optional | What it does |
+|---|---|---|---|
+| `blender.get_object` | `name` | — | Full detail of one object, mesh statistics included |
 | `blender.create_object` | `type`, `name` | `location`, `rotation`, `scale`, `collection` | Create a primitive |
-| `blender.update_object` | `name` | `location`, `rotation`, `scale`, `dimensions`, `visibility` | Change only the fields given |
-| `blender.delete_object` | `name` | — | Delete an object |
+| `blender.update_object` | `name` | `location`, `rotation`, `scale`, `dimensions`, `visibility`, `new_name`, `material`, `material_color` | Change only the fields given |
+| `blender.delete_object` | `name` | — | Delete an object, by exact name |
+
+### Advanced and render
+
+| Tool | Required | Optional | What it does |
+|---|---|---|---|
 | `blender.render` | — | `engine`, `resolution_x`, `resolution_y`, `samples`, `output_path` | Render the scene |
-| `blender.execute_python` | `code` | — | Run Python inside Blender |
+| `blender.execute_python` | `code` | — | Run Python inside Blender; a power-user escape hatch, not the normal path |
+
+### Undo grouping
+
+| Tool | Required | Optional | What it does |
+|---|---|---|---|
 | `blender.begin_transaction` | — | — | Start an undo group |
 | `blender.commit_transaction` | — | — | Keep the changes |
 | `blender.rollback_transaction` | — | — | Undo everything since `begin` |
 
 `create_object` accepts `cube`, `sphere`, `cylinder`, `cone`, `plane` and
-`torus`. The enum is in the tool's JSON schema, so a model cannot invent a
-primitive that does not exist.
+`torus`, in any case. The enum is in the tool's JSON schema, so a model cannot
+invent a primitive that does not exist, and the case is normalised for it.
+
+`get_scene` returns the whole scene; `get_objects` is the one to reach for when
+there are hundreds of objects, because it filters and pages:
+
+```json
+{
+  "objects": [{"name": "LegFL", "type": "MESH", "...": "..."}],
+  "count": 1, "total": 42, "offset": 0, "limit": 50, "truncated": true
+}
+```
+
+`total` is the number of matches before paging and `truncated` says whether more
+remain, so a model can tell that it has seen everything without guessing.
+
+### Examples
+
+`blender.get_scene` — the whole scene, no mesh data:
+
+```json
+{
+  "scene": "Scene",
+  "objects_count": 2,
+  "frame": 1,
+  "active_object": "TableTop",
+  "active_camera": "Camera",
+  "render_engine": "CYCLES",
+  "objects": [
+    {
+      "name": "TableTop", "type": "MESH",
+      "location": [0.0, 0.0, 0.75], "rotation": [0.0, 0.0, 0.0],
+      "scale": [1.6, 0.8, 0.05], "dimensions": [3.2, 1.6, 0.1], "visible": true
+    }
+  ],
+  "collections": ["Collection"],
+  "cameras": ["Camera"],
+  "lights": [{"name": "Key", "type": "AREA", "energy": 400.0}],
+  "render": {"engines": ["CYCLES", "BLENDER_EEVEE"], "resolution": [1920, 1080]}
+}
+```
+
+`blender.get_objects` — filtered and paged:
+
+```text
+blender.get_objects {"type": "MESH", "name_contains": "leg", "limit": 2}
+```
+
+`blender.create_object`:
+
+```text
+blender.create_object {"type": "CUBE", "name": "Table", "location": [0, 0, 1], "scale": [2, 1, 1]}
+```
+
+`blender.update_object` — rename and material in one call:
+
+```text
+blender.update_object {"name": "Table", "new_name": "TableTop"}
+blender.update_object {"name": "TableTop", "material": "Wood"}
+blender.update_object {"name": "TableTop", "material": "Red", "material_color": [0.8, 0.05, 0.05]}
+```
+
+`material` is created when it does not exist, and the response says so, so a
+model never has to guess whether the colour landed:
+
+```json
+{"success": true, "object": {"...": "..."}, "material": "Red", "material_created": true}
+```
+
+`blender.delete_object`:
+
+```text
+blender.delete_object {"name": "TableTop"}
+```
+
+`blender.render`:
+
+```text
+blender.render {"resolution_x": 1024, "resolution_y": 1024}
+```
 
 ### Responses
 
@@ -511,10 +628,18 @@ Two behaviours worth knowing:
 
 ### Idempotency
 
-`create_object(name="Table")` when `Table` exists **fails** with
-`OBJECT_ALREADY_EXISTS`. It does not quietly create `Table.001`, because the
-model asked for an object by name and would otherwise go on to refer to a name
-that does not exist. Deleting and re-creating is two deliberate calls.
+An agent may repeat a call. Two rules, both about names:
+
+* **`create_object(name="Table")` when `Table` exists fails** with
+  `OBJECT_ALREADY_EXISTS`. It does not quietly create `Table.001`, because the
+  model asked for an object by name and would then go on to refer to a name that
+  does not exist. Delete and re-create is two deliberate calls.
+* **`update_object(new_name=...)` onto a taken name fails** the same way, for
+  the same reason. Renaming an object to the name it already has is a no-op that
+  succeeds, so a retried rename is harmless.
+
+`delete_object` matches the exact name only. There is no fuzzy matching: a model
+that meant `Table` must not delete `Table.001` by accident.
 
 ## MCP resources
 
@@ -633,12 +758,12 @@ Failures are structured, with a stable `error.code` to branch on:
 | `OBJECT_ALREADY_EXISTS` | Refused rather than silently renamed |
 | `INVALID_OBJECT_TYPE` | Unknown primitive |
 | `INVALID_PARAMETER` | Bad vector, empty name, unknown engine |
-| `BLENDER_ERROR` | Blender itself raised |
-| `EXECUTION_ERROR` | `execute_python` code raised |
-| `VALIDATION_ERROR` | Code blocked by the Python policy screen |
+| `BLENDER_NOT_CONNECTED` | No add-on is attached to the bridge |
+| `BLENDER_OPERATION_FAILED` | Blender itself raised |
 | `TIMEOUT` | Blender did not answer in time |
-| `NOT_CONNECTED` | No add-on is attached to the bridge |
-| `PERMISSION_DENIED` | `ALLOW_PYTHON_EXECUTION=false` |
+| `PYTHON_EXECUTION_DISABLED` | `ALLOW_PYTHON_EXECUTION=false` |
+| `PYTHON_EXECUTION_ERROR` | `execute_python` code raised |
+| `VALIDATION_ERROR` | Code blocked by the Python policy screen |
 | `CONNECTION_LOST` | The socket dropped mid-request |
 | `MALFORMED_MESSAGE` | A frame could not be parsed |
 | `UNKNOWN_ACTION` | The add-on does not implement that action |
@@ -661,6 +786,9 @@ Request:
 {"id": "3f2a…", "action": "create_object", "params": {"type": "cube", "name": "Box"}}
 ```
 
+The dispatch field is `action`; the add-on also accepts `method` as a synonym,
+so a peer written against the other common spelling interoperates.
+
 Success:
 
 ```json
@@ -682,10 +810,11 @@ Error:
 | Action | Kind | Params |
 |---|---|---|
 | `get_scene` | read | `include_objects`, `include_details` |
+| `get_objects` | read | `type`, `collection`, `name_contains`, `limit`, `offset` |
 | `get_object` | read | `name` |
 | `ping` | read | — |
 | `create_object` | write | `type`, `name`, `location`, `rotation`, `scale`, `collection` |
-| `update_object` | write | `name` + any of `location`, `rotation`, `scale`, `dimensions`, `visibility` |
+| `update_object` | write | `name` + any of `location`, `rotation`, `scale`, `dimensions`, `visibility`, `new_name`, `material`, `material_color` |
 | `delete_object` | write | `name` |
 | `render` | write | `engine`, `resolution_x`, `resolution_y`, `resolution_percentage`, `samples`, `output_path` |
 | `execute_python` | write | `code` |
@@ -708,19 +837,51 @@ see it — a tool in `server/mcp/tools/`.
 | A second Blender connects | it takes over the bridge; the old one's pending requests fail fast |
 | A handler raises | caught, logged with a traceback, returned as `BLENDER_ERROR` |
 
-## Security: `blender.execute_python`
+## Security
+
+Read this before pointing anything other than your own machine at this server.
+
+### Network exposure
+
+* **The WebSocket bridge binds to `BLENDER_HOST`, which defaults to
+  `127.0.0.1`.** Keep it there. It has no authentication of any kind: anything
+  that can reach the port can drive your Blender, including
+  `blender.execute_python` if you have enabled it.
+* **The MCP server speaks stdio**, so it is only reachable by whoever can spawn
+  the process. `MCP_TRANSPORT=streamable-http` exists for tooling and debugging;
+  if you use it, bind it to loopback and put authentication in front of it. It
+  has none of its own.
+* **There is no auth, no multi-user support and no audit trail** beyond the
+  request log. That is deliberate for a local tool, not an oversight.
+
+### If you must expose it
+
+Don't, but if you do: keep it on a private network or behind an SSH tunnel, set
+`ALLOW_PYTHON_EXECUTION=false`, and treat the Blender process as compromised.
+`blender.execute_python` can run arbitrary code inside Blender, and Blender's
+Python can read your files.
+
+### Production notes
+
+* The request log is the only record of what a client did. It is one line per
+  call, on stderr, and safe to ship to a collector.
+* Error messages sent to a client are structured and short. Tracebacks stay in
+  the log, so a client cannot use an error to read the filesystem.
+* The add-on is standard-library only, has no network listener of its own, and
+  only ever dials the bridge address you give it.
+
+### `blender.execute_python`
 
 > **`blender.execute_python` is not a sandbox.**
 > It is intended for a **trusted, local** AI client. Blender's own Python API can
 > already read and write files, open sockets and terminate the application; no
 > amount of source screening changes that. Keep `ALLOW_PYTHON_EXECUTION=false`
-> unless you trust the model and the prompt it is working from, and never expose
-> this bridge to a network or to untrusted input.
+> unless you trust the model and the prompt it is working from.
 
 Two gates, both outside the tool so that no tool grows its own ad-hoc checks:
 
 1. **Permission.** `ALLOW_PYTHON_EXECUTION=false` (the default) refuses the call
-   with `PERMISSION_DENIED` before the socket is touched.
+   with `PYTHON_EXECUTION_DISABLED` before the socket is touched.
 2. **AST screen.** `server/validation/python.py` parses the code and rejects
    imports and calls that have no business in a 3D scripting session:
    `os`, `subprocess`, `shutil.rmtree`, `socket`, `requests`, `urllib`, `pathlib`
@@ -736,6 +897,20 @@ stricter policy can replace it later.
 The code itself never runs in the MCP server. It is validated, forwarded, and
 executed by the add-on on Blender's main thread in a fresh namespace, where
 `result` is pre-defined and nothing leaks between calls.
+
+## When to use `execute_python`
+
+It is a power-user escape hatch, not the intended path. In order of preference:
+
+1. `blender.get_scene` / `get_objects` / `get_object` to read the scene
+2. `create_object` / `update_object` / `delete_object` to change it
+3. `blender.begin_transaction` … `commit_transaction` to group the changes
+4. `blender.render` to look at the result
+5. `blender.execute_python` only for what the tools above do not cover
+
+If a model is writing Blender Python for something a tool could do, that is a gap
+in the tools, not a reason to reach for step 5. The tools return compact,
+predictable JSON and push an undo step; a Python snippet can do neither for you.
 
 ## Transactions and undo
 
@@ -777,11 +952,31 @@ a `.env` file next to the server. See `.env.example`.
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `LOG_FORMAT` | see `.env.example` | `logging` format string |
 
+Names are explicit about scope on purpose: `BLENDER_REQUEST_TIMEOUT` is the wait
+for a *Blender* response, `BLENDER_RENDER_TIMEOUT` is the longer one a render
+needs, and `MCP_PORT` only matters if you switch away from stdio.
+
 ```text
-2026-09-27 12:30:21 INFO server.blender.connection: Blender add-on connected from ('127.0.0.1', 51234)
-2026-09-27 12:30:21 INFO server.mcp.tools.render: MCP request blender.render {'resolution_x': 1024}
-2026-09-27 12:30:24 INFO server.blender.connection: Blender response id=3f2a… success=True
+2026-09-27 12:30:21 INFO server.mcp.support: mcp tool=blender.create_object request=7 duration_ms=41.8 success=true
+2026-09-27 12:30:24 INFO server.mcp.support: mcp tool=blender.render request=8 duration_ms=3012.4 success=true
+2026-09-27 12:30:25 INFO server.mcp.support: mcp tool=blender.get_object request=9 duration_ms=2.1 success=false error=OBJECT_NOT_FOUND
+2026-09-27 12:30:26 INFO server.blender.connection: Blender add-on connected from ('127.0.0.1', 51234)
 ```
+
+One line per MCP call, in a fixed `key=value` shape, added by
+`server/mcp/support.py` at registration so no tool has to remember to do it:
+
+| Field | Meaning |
+|---|---|
+| `tool` | The MCP tool name |
+| `request` | The MCP request id, so a line can be tied to a client trace |
+| `duration_ms` | Wall-clock time of the tool call |
+| `success` | `true` / `false` |
+| `error` | The structured error code, when it failed |
+
+An expected failure is `INFO` with no traceback, because a model asking for an
+object that is not there is normal operation. A traceback appears only for
+something nobody anticipated, and it stays in the log rather than in the reply.
 
 ## Project layout
 
@@ -815,10 +1010,10 @@ blender-mcp/
 │   ├── executor.py              # executes model-written code
 │   └── ui.py                    # N-panel and its operators
 │
-├── tests/                       # pytest; 319 tests (259 without bpy)
+├── tests/                       # pytest; 376 tests (295 without bpy)
 │   └── support/                 # protocol double, stubs, the bpy gate
 │
-├── examples/                    # create_cube, create_scene, test_scene, GUI demo
+├── examples/                    # bridge scripts, acceptance checks, GUI demo
 ├── docs/                        # what the two demo scripts produce
 └── …
 ```
@@ -849,11 +1044,12 @@ The suite is layered to match the architecture:
 | `test_validation.py` | The Python policy screen: what is allowed, what is blocked, why |
 | `test_tools.py` | Each tool's request shape, and the error it returns |
 | `test_transport.py` | The add-on's real WebSocket client against the real server: handshake, framing, pings, timeouts, disconnects, takeover |
-| `test_end_to_end.py` | A full MCP session against a Blender double over a real socket |
+| `test_end_to_end.py` | A full MCP session against a Blender double over a real socket, plus request logging through the real registry |
 | `test_addon_protocol.py` | The add-on's stdlib protocol copy has not drifted from the server's |
 | `test_architecture.py` | The layering rules, and that every module compiles |
+| `test_request_logging.py` | One log line per call: id, duration, outcome, error code, and that the signature survives instrumentation |
 | `test_entrypoint.py` | `python -m server.main` spawned as a subprocess and driven over stdio |
-| `test_blender_integration.py` | **Needs `bpy`.** The operator layer against real Blender: primitive sizes, transforms, undo, `execute_python`, a real render |
+| `test_blender_integration.py` | **Needs `bpy`.** The operator layer against real Blender: primitive sizes, transforms, `get_objects` paging, rename, materials, mesh statistics, undo, `execute_python`, a real render |
 | `test_blender_bridge.py` | **Needs `bpy`.** The whole chain, MCP client → server → add-on → real scene |
 
 Where a real Blender is not available, the tests use a **protocol double**
@@ -867,36 +1063,73 @@ rendering are exercised by running the real add-on in Blender.
 
 Planned, roughly in the order they become useful:
 
-* **Materials** — `create_material`, `assign_material`, and the node-based
-  properties models actually reach for (`base_color`, `metallic`, `roughness`)
-* **Meshes** — primitives beyond the six, booleans, extrusion, subdivision
+* **Richer mesh operations** — primitives beyond the six, booleans, extrusion,
+  subdivision, mesh statistics per selection rather than per object
+* **Materials** — `create_material` and the node properties models actually
+  reach for (`metallic`, `roughness`, node graphs). Today
+  `update_object(material=...)` assigns by name and creates a flat colour, which
+  covers "make this red" and nothing more
 * **Modifiers** — add, configure, order, remove
 * **Geometry nodes** — build and wire node trees
 * **Textures and UV** — image textures, UV operations, unwrapping
 * **Collections** — create, nest, move objects between them
-* **Cameras and lighting** — add cameras, set the active one, place and tune
-  lights, depth of field
+* **Camera and light controls** — add cameras, set the active one, place and
+  tune lights, depth of field. Today this is `execute_python` territory
 * **Animation** — keyframes, drivers, frame ranges, playback control
 * **Rigging** — armatures and pose
-* **Assets** — import and place assets from libraries
 * **Scene diff** — "what changed since I last looked?", so a model can verify
   its own work instead of re-reading everything
-* **`blender.inspect_image`** — hand a render to a vision model and get
-  critique back. This is the piece that closes the loop
+* **Render resources** — `blender://render/latest`, and the image returned as
+  MCP image content
+* **Vision feedback loop** — `blender.inspect_image`: hand a render to a vision
+  model and get critique back. This is the piece that closes the loop
   *plan → build → render → look → correct → render*, and it is why the render
-  tool's response shape leaves room for the image itself
-* **Inline render results** — return the image as MCP image content, plus a
-  `blender://render/latest` resource
+  tool's response shape leaves room for the image itself. The vision model
+  belongs to the client, not here
+* **Transaction and undo** — named checkpoints, selective undo
 * **Batch operations** — apply a list of operations in one call, with one undo
   step and per-item results
 * **Blender event notifications** — push notifications when the scene changes
   underneath the model, rather than having it poll
-* **Undo/rollback** — richer transactions: named checkpoints, selective undo
+* **Authentication** — a token on the bridge, so it can leave loopback
 * **Multi-Blender** — a bridge that routes to several instances by name
 
-Out of scope on purpose: distributed deployment, Docker, Kubernetes,
-authentication, multi-user, a database, a web dashboard, vector stores and RAG.
-This is a local tool, and adding those would not make it better at being one.
+Out of scope on purpose, and not planned: distributed deployment, Docker,
+Kubernetes, multi-user, a database, a web dashboard, vector stores and RAG.
+This is a local MCP backend, and adding those would not make it better at being
+one.
+
+### Not this project's job
+
+This is an MCP server and nothing more. It has no opinion about models, and it
+must stay that way for a client to be able to swap one out:
+
+* no OpenAI, Anthropic or Gemini SDK, no provider-specific branches, no
+  `if model == ...` anywhere
+* no GUI toolkit, no chat, no benchmark harness
+* no Tripo or any other asset-provider integration
+
+A separate GUI client may use `blender-mcp` as an MCP backend, exactly the way
+Claude Desktop or Cursor does:
+
+```text
+                  Blender AI Studio            (a separate project)
+                         |
+                     AI Agent
+                    /        \
+                  LLM        Tools
+                 /             \
+        GPT / Claude /      MCP Client
+        Gemini / etc.           |
+                                v
+                          blender-mcp
+                                |
+                             Blender
+```
+
+The agent on top may also call other providers — Tripo, a vision model — but it
+does that itself. `blender-mcp` only speaks MCP to Blender, which is why it can
+sit underneath any of them.
 
 ## License
 

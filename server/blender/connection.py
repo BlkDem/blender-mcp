@@ -93,7 +93,7 @@ class BlenderBridge:
             raise BlenderMCPError(
                 f"No Blender instance is connected. Start Blender, enable the "
                 f"'Blender MCP' add-on and press Connect. Bridge: ws://{self._host}:{self._port}",
-                code=ErrorCode.NOT_CONNECTED,
+                code=ErrorCode.BLENDER_NOT_CONNECTED,
             )
         return await client.request(action, params, timeout=timeout)
 

@@ -18,22 +18,26 @@ from typing import Any
 class ErrorCode(StrEnum):
     """Stable, machine-readable error identifiers.
 
-    The first ten codes are the public contract; the rest cover the transport
-    and the add-on and are documented in the README.
+    These are the public contract: a model branches on ``error.code``, so the
+    names are specific about *what* failed rather than generic. ``BLENDER_*`` is
+    anything Blender itself refused, ``PYTHON_*`` is the ``execute_python``
+    path, and the transport codes cover the WebSocket bridge.
     """
 
-    # Public contract
+    # Object operations
     OBJECT_NOT_FOUND = "OBJECT_NOT_FOUND"
     OBJECT_ALREADY_EXISTS = "OBJECT_ALREADY_EXISTS"
     INVALID_OBJECT_TYPE = "INVALID_OBJECT_TYPE"
     INVALID_PARAMETER = "INVALID_PARAMETER"
-    BLENDER_ERROR = "BLENDER_ERROR"
-    EXECUTION_ERROR = "EXECUTION_ERROR"
-    VALIDATION_ERROR = "VALIDATION_ERROR"
+    # Blender itself
+    BLENDER_NOT_CONNECTED = "BLENDER_NOT_CONNECTED"
+    BLENDER_OPERATION_FAILED = "BLENDER_OPERATION_FAILED"
     TIMEOUT = "TIMEOUT"
-    NOT_CONNECTED = "NOT_CONNECTED"
-    PERMISSION_DENIED = "PERMISSION_DENIED"
-    # Transport / add-on
+    # execute_python
+    PYTHON_EXECUTION_DISABLED = "PYTHON_EXECUTION_DISABLED"
+    PYTHON_EXECUTION_ERROR = "PYTHON_EXECUTION_ERROR"
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    # Transport and the add-on
     CONNECTION_LOST = "CONNECTION_LOST"
     MALFORMED_MESSAGE = "MALFORMED_MESSAGE"
     UNKNOWN_ACTION = "UNKNOWN_ACTION"

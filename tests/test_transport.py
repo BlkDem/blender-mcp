@@ -252,10 +252,10 @@ async def test_request_reaches_the_addon_and_the_result_comes_back() -> None:
     bridge = make_bridge(port)
     await bridge.start()
     try:
-        stub = await open_addon(port, result={"success": True, "objects_total": 2})
+        stub = await open_addon(port, result={"success": True, "objects_count": 2})
         await wait_until_connected(bridge)
 
-        assert await bridge.request(Action.GET_SCENE) == {"success": True, "objects_total": 2}
+        assert await bridge.request(Action.GET_SCENE) == {"success": True, "objects_count": 2}
         assert stub.requests[0]["action"] == "get_scene"
         assert stub.requests[0]["id"]
         assert bridge.status()["connected"] is True
@@ -286,7 +286,7 @@ async def test_request_without_a_connection_fails_with_not_connected() -> None:
     try:
         with pytest.raises(BlenderMCPError) as excinfo:
             await bridge.request(Action.GET_SCENE)
-        assert excinfo.value.code is ErrorCode.NOT_CONNECTED
+        assert excinfo.value.code is ErrorCode.BLENDER_NOT_CONNECTED
     finally:
         await bridge.stop()
 

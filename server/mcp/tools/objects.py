@@ -14,10 +14,11 @@ silent rename is.
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
+from pydantic import Field
 
 from server.blender.protocol import Action
 from server.errors import BlenderMCPError, ErrorCode
@@ -30,7 +31,7 @@ SUPPORTED_TYPES: tuple[str, ...] = ("cube", "sphere", "cylinder", "cone", "plane
 CREATE_OBJECT_DESCRIPTION = """\
 Create a mesh object in the active scene.
 
-type: one of cube, sphere, cylinder, cone, plane, torus.
+type: one of cube, sphere, cylinder, cone, plane, torus. Case does not matter.
 name: must be unique; an existing name fails with OBJECT_ALREADY_EXISTS
       rather than being renamed to "Name.001".
 location / scale: Blender units (meters), as [x, y, z].
@@ -46,7 +47,15 @@ keep their current value.
 location / scale: Blender units (meters) as [x, y, z].
 rotation: DEGREES as [x, y, z].
 dimensions: final bounding-box size in meters as [x, y, z] (replaces scale).
-visibility: hide or show the object in the viewport and renders.\
+visibility: hide or show the object in the viewport and renders.
+new_name: rename the object. Fails with OBJECT_ALREADY_EXISTS if that name is
+          taken, rather than silently becoming "Name.001".
+material: material name to assign, replacing the object's material slots.
+          Created if it does not exist yet; the response says whether it did,
+          through "material_created".
+material_color: [r, g, b] or [r, g, b, a] in 0..1, used only when the material
+          has to be created. Sets both the viewport colour and the shader, so
+          the solid view and the render agree.\
 """
 
 DELETE_OBJECT_DESCRIPTION = """\
@@ -91,6 +100,38 @@ def _vector(name: str, value: Any, *, allow_negative: bool = True) -> Vector3:
     return numbers
 
 
+def _colour(name: str, value: Any) -> list[float]:
+    """Validate an RGB or RGBA colour in 0..1.
+
+    Alpha is optional and defaults away here; the add-on pads it. Rejecting
+    out-of-range values matters because Blender silently clamps them, and a
+    model that asked for 1.5 red should hear about it.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) not in (3, 4):
+        raise tool_error(
+            BlenderMCPError(
+                f"{name} must be [r, g, b] or [r, g, b, a] with values in 0..1",
+                code=ErrorCode.INVALID_PARAMETER,
+                details={"received": value},
+            )
+        )
+    try:
+        components = [float(component) for component in value]
+    except (TypeError, ValueError) as exc:
+        raise tool_error(
+            BlenderMCPError(f"{name} must contain only numbers", code=ErrorCode.INVALID_PARAMETER)
+        ) from exc
+    if any(component < 0.0 or component > 1.0 for component in components):
+        raise tool_error(
+            BlenderMCPError(
+                f"{name} components must be within 0..1",
+                code=ErrorCode.INVALID_PARAMETER,
+                details={"received": components},
+            )
+        )
+    return components
+
+
 def _require_name(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         raise tool_error(BlenderMCPError("Object name must not be empty"))
@@ -99,15 +140,23 @@ def _require_name(name: str) -> str:
 
 async def create_object(
     ctx: Context,
-    type: Literal["cube", "sphere", "cylinder", "cone", "plane", "torus"],
-    name: str,
+    type: str = Field(
+        description=(
+            "Primitive to create: cube, sphere, cylinder, cone, plane or torus. Case does not "
+            "matter. The schema lists the valid values, but the tool is case-tolerant because a "
+            "model writing CUBE should not be turned away for it."
+        ),
+        json_schema_extra={"enum": list(SUPPORTED_TYPES)},
+    ),
+    name: str = Field(description="Unique object name; an existing name is refused."),
     location: Vector3 | None = None,
     rotation: Vector3 | None = None,
     scale: Vector3 | None = None,
     collection: str | None = None,
 ) -> dict[str, Any]:
     """Create a mesh object."""
-    if type not in SUPPORTED_TYPES:
+    normalized = str(type).lower()
+    if normalized not in SUPPORTED_TYPES:
         raise tool_error(
             BlenderMCPError(
                 f"Unsupported object type '{type}'",
@@ -115,7 +164,7 @@ async def create_object(
                 details={"supported": list(SUPPORTED_TYPES)},
             )
         )
-    params: dict[str, Any] = {"type": type, "name": _require_name(name)}
+    params: dict[str, Any] = {"type": normalized, "name": _require_name(name)}
     if location is not None:
         params["location"] = _vector("location", location)
     if rotation is not None:
@@ -140,6 +189,9 @@ async def update_object(
     scale: Vector3 | None = None,
     dimensions: Vector3 | None = None,
     visibility: bool | None = None,
+    new_name: str | None = None,
+    material: str | None = None,
+    material_color: Vector3 | None = None,
 ) -> dict[str, Any]:
     """Change only the given properties of an object."""
     _require_name(name)
@@ -154,10 +206,19 @@ async def update_object(
         params["dimensions"] = _vector("dimensions", dimensions, allow_negative=False)
     if visibility is not None:
         params["visibility"] = bool(visibility)
+    if new_name is not None:
+        params["new_name"] = _require_name(new_name)
+    if material is not None:
+        if not str(material).strip():
+            raise tool_error(BlenderMCPError("'material' must not be empty"))
+        params["material"] = str(material)
+        if material_color is not None:
+            params["material_color"] = _colour("material_color", material_color)
     if len(params) == 1:
         raise tool_error(
             BlenderMCPError(
-                "Nothing to update: pass at least one of location, rotation, scale, dimensions, visibility",
+                "Nothing to update: pass at least one of location, rotation, scale, "
+                "dimensions, visibility, new_name, material",
                 code=ErrorCode.INVALID_PARAMETER,
             )
         )

@@ -49,9 +49,9 @@ def test_error_envelope_shape_matches_the_server_model() -> None:
 def test_addon_response_parses_as_a_server_response() -> None:
     from server.blender.protocol import Response
 
-    raw = addon.encode_response("abc", {"objects_total": 1})
+    raw = addon.encode_response("abc", {"objects_count": 1})
     response = Response.model_validate_json(raw)
-    assert response.raise_for_status() == {"objects_total": 1}
+    assert response.raise_for_status() == {"objects_count": 1}
 
 
 def test_addon_error_parses_as_a_server_response() -> None:
@@ -66,7 +66,7 @@ def test_addon_error_parses_as_a_server_response() -> None:
 
 
 def test_addon_error_carries_details() -> None:
-    raw = addon.encode_error("abc", addon.EXECUTION_ERROR, "boom", {"traceback": ["line 1"]})
+    raw = addon.encode_error("abc", addon.PYTHON_EXECUTION_ERROR, "boom", {"traceback": ["line 1"]})
     assert json.loads(raw)["error"]["details"] == {"traceback": ["line 1"]}
 
 
@@ -110,9 +110,22 @@ def test_encode_exception_maps_an_action_error_to_its_code() -> None:
 def test_encode_exception_wraps_anything_else_as_a_blender_error() -> None:
     raw = addon.encode_exception("abc", ValueError("bad value"))
     payload = json.loads(raw)
-    assert payload["error"]["code"] == addon.BLENDER_ERROR
+    assert payload["error"]["code"] == addon.BLENDER_OPERATION_FAILED
     assert payload["error"]["message"] == "ValueError: bad value"
 
 
 def test_protocol_version_is_declared() -> None:
     assert addon.PROTOCOL_VERSION == 1
+
+
+def test_method_is_accepted_as_a_synonym_for_action() -> None:
+    """The other common spelling of the dispatch field interoperates."""
+    request_id, action, params = addon.parse_request(
+        '{"id": "abc", "method": "create_object", "params": {"name": "Cube"}}'
+    )
+    assert (request_id, action, params) == ("abc", "create_object", {"name": "Cube"})
+
+
+def test_action_wins_when_both_spellings_are_present() -> None:
+    _, action, _ = addon.parse_request('{"id": "abc", "action": "get_scene", "method": "delete_object"}')
+    assert action == "get_scene"

@@ -8,9 +8,9 @@ mutating a real scene.
 
 One thing it cannot cover headlessly: Blender's timer scheduler. The add-on
 normally runs its actions from ``bpy.app.timers``, which needs Blender's event
-loop. These tests call ``_drain_inbox`` directly instead — the same function, on
-the same main thread, reading the same queue — so the dispatch path is exercised
-but the scheduler registration is not.
+loop. These tests call :meth:`BlenderConnection.drain` directly instead — the same
+function the timer calls, on the same main thread, reading the same queue — so the
+dispatch path is exercised but the scheduler registration is not.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ async def stack(**overrides) -> AsyncIterator[tuple[ClientSession, BlenderConnec
 
                 async def pump() -> None:
                     while pumping:
-                        add_on._drain_inbox()  # noqa: SLF001
+                        add_on.drain()
                         await anyio.sleep(0.01)
 
                 async with anyio.create_task_group() as pump_group:
@@ -110,7 +110,7 @@ async def test_the_addon_reports_a_working_bridge() -> None:
         assert add_on.is_connected
         result = payload_of(await session.call_tool("blender.get_scene", {}))
         assert result["scene"] == bpy.context.scene.name
-        assert result["objects_total"] == len(bpy.data.objects)
+        assert result["objects_count"] == len(bpy.data.objects)
 
 
 async def test_create_object_reaches_real_bpy() -> None:
@@ -129,7 +129,7 @@ async def test_create_object_reaches_real_bpy() -> None:
 async def test_the_full_acceptance_walkthrough() -> None:
     async with stack() as (session, _):
         scene = payload_of(await session.call_tool("blender.get_scene", {}))
-        assert scene["objects_total"] == 0
+        assert scene["objects_count"] == 0
 
         payload_of(await session.call_tool("blender.create_object", {"type": "cube", "name": "Box"}))
         fetched = payload_of(await session.call_tool("blender.get_object", {"name": "Box"}))
@@ -170,7 +170,7 @@ async def test_execute_python_runs_in_blender() -> None:
 async def test_execute_python_is_refused_when_disabled() -> None:
     async with stack(allow_python_execution=False) as (session, _):
         result = await session.call_tool("blender.execute_python", {"code": "import bpy"})
-    assert error_of(result)["code"] == "PERMISSION_DENIED"
+    assert error_of(result)["code"] == "PYTHON_EXECUTION_DISABLED"
 
 
 async def test_blocked_code_never_reaches_blender() -> None:
@@ -211,7 +211,7 @@ async def test_resources_read_the_real_scene() -> None:
             await session.call_tool("blender.create_object", {"type": "cube", "name": name})
         scene = json.loads((await session.read_resource("blender://scene")).contents[0].text)
         objects = json.loads((await session.read_resource("blender://objects")).contents[0].text)
-    assert scene["objects_total"] == 2
+    assert scene["objects_count"] == 2
     assert sorted(obj["name"] for obj in objects["objects"]) == ["A", "B"]
 
 
@@ -251,7 +251,7 @@ async def test_a_build_a_table_chain_from_the_readme() -> None:
         scene = payload_of(await session.call_tool("blender.get_scene", {}))
 
     assert outcome["result"]["result"] == {"materialised": 5}
-    assert scene["objects_total"] == 5
+    assert scene["objects_count"] == 5
     assert bpy.data.objects["TableTop"].data.materials[0].name == "Wood"
     assert scene["objects"][0]["name"] in {"TableTop", "LegFL", "LegFR", "LegBL", "LegBR"}
 
@@ -271,7 +271,7 @@ async def test_the_bridge_reports_not_connected_without_the_addon() -> None:
             async with ClientSession(client_streams[0], client_streams[1]) as session:
                 await session.initialize()
                 result = await session.call_tool("blender.get_scene", {})
-                assert error_of(result)["code"] == "NOT_CONNECTED"
+                assert error_of(result)["code"] == "BLENDER_NOT_CONNECTED"
             task_group.cancel_scope.cancel()
 
 

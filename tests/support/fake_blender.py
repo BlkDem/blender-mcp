@@ -18,6 +18,11 @@ from blender_mcp import protocol
 from blender_mcp.websocket import WebSocket, WebSocketClosed, WebSocketError
 
 #: A unit cube has a 2 m side, matching Blender's default primitive.
+#: Mesh statistics the double reports. Real values come from the add-on; these
+#: just have to be stable and distinct per primitive.
+_VERTEX_COUNTS = {"cube": 8, "sphere": 482, "cylinder": 66, "cone": 35, "plane": 4, "torus": 576}
+_FACE_COUNTS = {"cube": 6, "sphere": 480, "cylinder": 32, "cone": 33, "plane": 1, "torus": 576}
+
 _BASE_SIZES = {
     "cube": (2.0, 2.0, 2.0),
     "sphere": (2.0, 2.0, 2.0),
@@ -37,7 +42,10 @@ class _Object:
         self.rotation = [float(v) for v in params.get("rotation", [0.0, 0.0, 0.0])]
         self.scale = [float(v) for v in params.get("scale", [1.0, 1.0, 1.0])]
         self.hidden = False
+        self.materials: list[str] = []
         self.base = list(_BASE_SIZES.get(object_type, (1.0, 1.0, 1.0)))
+        self.vertices = _VERTEX_COUNTS.get(object_type, 8)
+        self.polygons = _FACE_COUNTS.get(object_type, 6)
 
     @property
     def dimensions(self) -> list[float]:
@@ -51,6 +59,7 @@ class _Object:
             "rotation": [round(v, 6) for v in self.rotation],
             "scale": [round(v, 6) for v in self.scale],
             "dimensions": self.dimensions,
+            "visible": not self.hidden,
         }
 
     def detail(self) -> dict[str, Any]:
@@ -59,7 +68,7 @@ class _Object:
             {
                 "collection": ["Collection"],
                 "parent": None,
-                "materials": [],
+                "materials": list(self.materials),
                 "modifiers": [],
                 "visibility": {
                     "hide_viewport": self.hidden,
@@ -67,6 +76,10 @@ class _Object:
                     "visible": not self.hidden,
                 },
                 "data": f"{self.name}Mesh",
+                "vertices": self.vertices,
+                "edges": self.vertices,
+                "polygons": self.polygons,
+                "loops": self.polygons * 4,
             }
         )
         return summary
@@ -77,6 +90,7 @@ class FakeBlender:
 
     def __init__(self) -> None:
         self.objects: dict[str, _Object] = {}
+        self.materials: list[str] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.transaction_open = False
         self.transaction_steps = 0
@@ -175,6 +189,8 @@ class FakeBlender:
             return {"pong": True, "blender_version": "fake", "scene": "Scene"}
         if action == protocol.GET_SCENE:
             return self._get_scene(params)
+        if action == protocol.GET_OBJECTS:
+            return self._get_objects(params)
         if action == protocol.GET_OBJECT:
             return self._lookup(params["name"]).detail()
         if action == protocol.CREATE_OBJECT:
@@ -208,14 +224,40 @@ class FakeBlender:
         detailed = bool(params.get("include_details"))
         return {
             "scene": "Scene",
-            "objects_total": len(objects),
-            "frame_current": 1,
+            "objects_count": len(objects),
+            "frame": 1,
+            "active_object": objects[0].name if objects else None,
+            "active_camera": "Camera",
+            "render_engine": "CYCLES",
             "objects": [obj.detail() if detailed else obj.summary() for obj in objects],
             "collections": ["Collection"],
             "cameras": ["Camera"],
             "lights": [],
-            "active_camera": "Camera",
-            "render": {"engine": "CYCLES", "engines": ["CYCLES"], "resolution": [1920, 1080]},
+            "render": {"engines": ["CYCLES"], "resolution": [1920, 1080]},
+        }
+
+    def _get_objects(self, params: dict[str, Any]) -> dict[str, Any]:
+        matches = sorted(self.objects.values(), key=lambda obj: obj.name)
+        wanted_type = params.get("type")
+        if wanted_type:
+            matches = [obj for obj in matches if obj.type == wanted_type]
+        collection = params.get("collection")
+        if collection:
+            matches = [obj for obj in matches if collection in obj.collection]
+        needle = params.get("name_contains")
+        if needle:
+            matches = [obj for obj in matches if needle.lower() in obj.name.lower()]
+        total = len(matches)
+        offset = max(0, int(params.get("offset", 0)))
+        limit = min(max(1, int(params.get("limit", 50))), 500)
+        page = matches[offset : offset + limit]
+        return {
+            "objects": [obj.summary() for obj in page],
+            "count": len(page),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(page) < total,
         }
 
     def _create(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -234,7 +276,8 @@ class FakeBlender:
         return {"success": True, "object": obj.detail()}
 
     def _update(self, params: dict[str, Any]) -> dict[str, Any]:
-        obj = self._lookup(params["name"])
+        name = params["name"]
+        obj = self._lookup(name)
         for field in ("location", "rotation"):
             if params.get(field) is not None:
                 setattr(obj, field, [float(v) for v in params[field]])
@@ -244,4 +287,24 @@ class FakeBlender:
             obj.scale = [float(params["dimensions"][i]) / max(obj.base[i], 1e-6) for i in range(3)]
         if params.get("visibility") is not None:
             obj.hidden = not bool(params["visibility"])
-        return {"success": True, "object": obj.detail()}
+        payload: dict[str, Any] = {"success": True, "object": obj.detail()}
+        new_name = params.get("new_name")
+        if new_name:
+            if new_name in self.objects and new_name != obj.name:
+                raise protocol.ActionError(
+                    protocol.OBJECT_ALREADY_EXISTS, f"Cannot rename to '{new_name}': taken"
+                )
+            if new_name != obj.name:
+                self.objects[new_name] = self.objects.pop(obj.name)
+                obj.name = new_name
+                payload = {"success": True, "object": obj.detail(), "renamed_to": f"{name} -> {new_name}"}
+        material = params.get("material")
+        if material:
+            created = material not in self.materials
+            if created:
+                self.materials.append(material)
+            obj.materials = [material]
+            payload["material"] = material
+            payload["material_created"] = created
+            payload["object"] = obj.detail()
+        return payload
