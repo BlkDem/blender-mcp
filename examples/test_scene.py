@@ -152,7 +152,7 @@ result = {"materials": len(bpy.data.materials), "lights": 2, "objects": len(bpy.
 """
         }
     )
-    return operators.get_scene({"include_details": True})
+    return operators.get_scene({"include_details": True, "object_limit": 1000})
 
 
 def main() -> int:
@@ -161,7 +161,7 @@ def main() -> int:
 
     started = time.perf_counter()
     scene = build()
-    print(f"Scene built in {time.perf_counter() - started:.2f}s: {scene['objects_total']} objects")
+    print(f"Scene built in {time.perf_counter() - started:.2f}s: {scene['objects_count']} objects")
     for obj in scene["objects"]:
         print(f"  {obj['name']:<10} {obj['type']:<6} {obj['dimensions']}")
 

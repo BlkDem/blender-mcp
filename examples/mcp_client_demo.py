@@ -84,12 +84,24 @@ class Client:
             raise RuntimeError(f"{name} failed: {json.dumps(json.loads(tail), indent=2)}")
         return result.structured_content
 
+    async def blocks(self, name: str, arguments: dict | None = None) -> list:
+        """For the tools that answer with content blocks, not one JSON object."""
+        result = await self.session.call_tool(name, arguments or {})
+        if result.is_error:
+            text = result.content[0].text
+            _, _, tail = text.partition(": ")
+            raise RuntimeError(f"{name} failed: {json.dumps(json.loads(tail), indent=2)}")
+        return result.content
+
     async def build_the_table(self) -> None:
         """Example 4 from the README, as a chain of tool calls."""
         legs = {"LegFL": (-0.9, -0.4), "LegFR": (0.9, -0.4), "LegBL": (-0.9, 0.4), "LegBR": (0.9, 0.4)}
 
         scene = await self.call("blender.get_scene")
-        log(f"scene starts with {scene['objects_total']} objects")
+        log(
+            f"scene starts with {scene['objects_count']} objects "
+            f"(showing {scene['objects_shown']}, truncated={scene['objects_truncated']})"
+        )
 
         await self.call("blender.begin_transaction")
         await self.call(
@@ -121,7 +133,64 @@ class Client:
 
         final = await self.call("blender.get_scene")
         names = sorted(obj["name"] for obj in final["objects"])
-        log(f"scene now: {final['objects_total']} objects: {', '.join(names)}")
+        log(f"scene now: {final['objects_count']} objects: {', '.join(names)}")
+
+        await self.show_the_new_tools(names)
+
+    async def show_the_new_tools(self, names: list[str]) -> None:
+        """The things this build added on top of the README's example.
+
+        Each one is worth a look in a real window: the picture, the registry
+        entry, and a rollback you can see happen.
+        """
+        instances = await self.call("blender.get_instances")
+        active = instances["active"]
+        log(
+            f"instance {active['id']} (pid {active['pid']}, Blender {active['blender_version']}) "
+            f"on {active['address']}; takeover_allowed={instances['takeover_allowed']}"
+        )
+
+        still = await self.blocks("blender.wait_for_change", {"timeout": 0.5})
+        log(f"wait_for_change on a quiet scene -> {json.loads(still[0].text)['changed']}")
+
+        preview = await self.blocks("blender.render_preview", {"max_edge": 640})
+        summary = json.loads(preview[0].text)
+        image = [block for block in preview if getattr(block, "type", None) == "image"]
+        log(
+            f"render_preview -> {summary['output_path']} in {summary['render_time']}s, "
+            f"{len(image)} image block(s), {len(image[0].data) if image else 0} base64 chars"
+        )
+
+        # Two rollbacks, because the difference between them is the point: a
+        # checkpoint discards what came after it, the transaction start discards
+        # the lot. The first leaves the spare cube alone, the second removes it.
+        await self.call("blender.begin_transaction", {"label": "demo"})
+        await self.call("blender.create_object", {"type": "cube", "name": "Spare", "location": [2, 2, 2]})
+        await self.call("blender.checkpoint", {"label": "spare"})
+        await self.call("blender.update_object", {"name": "Ball", "location": [9, 9, 9]})
+        log(f"Ball moved to {[9, 9, 9]}")
+
+        rolled = await self.call("blender.rollback_transaction", {"to": "spare"})
+        log(
+            f"rolled back to '{rolled['checkpoint']}' -> restored {rolled['restored']} object(s), "
+            f"transaction {rolled['transaction']}, unrecoverable={rolled['unrecoverable']}"
+        )
+        ball = await self.call("blender.get_object", {"name": "Ball"})  # the object itself
+        after_stage = await self.call("blender.get_objects", {"limit": 50})
+        stage_names = sorted(obj["name"] for obj in after_stage["objects"])
+        log(
+            f"Ball back at {ball['location']}; the cube made before the checkpoint "
+            f"stayed: {'Spare' in stage_names}"
+        )
+
+        closed = await self.call("blender.rollback_transaction", {})
+        log(
+            f"rolled back to the start -> {closed['restored']} object(s) restored, "
+            f"transaction {closed['transaction']}"
+        )
+        final_stage = await self.call("blender.get_objects", {"limit": 50})
+        end_names = sorted(obj["name"] for obj in final_stage["objects"])
+        log(f"Spare gone: {'Spare' not in end_names} -> {end_names}")
 
 
 #: Materials, lights and a camera, in one snippet — the part of a build that the

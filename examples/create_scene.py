@@ -100,9 +100,10 @@ def _summarise(result: dict[str, Any]) -> str:
     if "object" in result:
         obj = result["object"]
         return f"{obj['name']} at {obj['location']} ({obj['dimensions']})"
-    if "objects_total" in result:
+    if "objects_count" in result:
         names = [obj["name"] for obj in result.get("objects", [])]
-        return f"{result['objects_total']} object(s): {', '.join(names) or 'none'}"
+        shown = result.get("objects_shown", len(names))
+        return f"{result['objects_count']} object(s), {shown} shown: {', '.join(names) or 'none'}"
     return json.dumps(result)
 
 
