@@ -129,7 +129,11 @@ async def test_the_tool_list_is_what_the_brief_asks_for() -> None:
         "blender.update_object",
         "blender.delete_object",
         "blender.render",
+        "blender.render_preview",
         "blender.execute_python",
+        "blender.wait_for_change",
+        "blender.get_instances",
+        "blender.checkpoint",
         "blender.begin_transaction",
         "blender.commit_transaction",
         "blender.rollback_transaction",
@@ -145,10 +149,19 @@ async def test_every_tool_has_a_description_the_model_can_act_on() -> None:
 
 
 async def test_tools_advertise_structured_output() -> None:
+    """Every tool but render_preview returns a single JSON object.
+
+    render_preview returns content blocks (JSON summary plus an image), which has
+    no one schema to declare.
+    """
     async with mcp_server() as env:
         tools = (await env.session.list_tools()).tools
+    without_schema = {"blender.render_preview", "blender.wait_for_change"}
     for tool in tools:
-        assert tool.output_schema is not None, tool.name
+        if tool.name in without_schema:
+            assert tool.output_schema is None, f"{tool.name} unexpectedly has a schema"
+        else:
+            assert tool.output_schema is not None, tool.name
 
 
 async def test_create_object_parameters_match_the_brief() -> None:
@@ -189,7 +202,7 @@ async def test_render_parameters_match_the_brief() -> None:
 async def test_resource_list_matches_the_brief() -> None:
     async with mcp_server() as env:
         uris = {str(r.uri) for r in (await env.session.list_resources()).resources}
-    assert uris == {"blender://scene", "blender://objects"}
+    assert uris == {"blender://scene", "blender://objects", "blender://render/latest"}
 
 
 async def test_server_advertises_instructions() -> None:

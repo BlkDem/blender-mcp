@@ -15,6 +15,7 @@ there.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -23,7 +24,7 @@ from mcp.server.mcpserver.context import Context
 from server.blender.protocol import Action
 from server.config import Settings
 from server.errors import BlenderMCPError, ErrorCode
-from server.mcp.support import bridge_of, register, settings_of, tool_error
+from server.mcp.support import bridge_of, register_all, settings_of, tool_error
 from server.validation.python import validate_python
 
 logger = logging.getLogger(__name__)
@@ -93,5 +94,9 @@ async def execute_python(ctx: Context, code: str) -> dict[str, Any]:
     return {"success": True, "validation": screening, "result": result}
 
 
-def register_tools(server: MCPServer) -> None:
-    register(server, execute_python, "blender.execute_python", EXECUTE_PYTHON_DESCRIPTION)
+def register_tools(server: MCPServer, enabled: Callable[[str], bool] | None = None) -> list[str]:
+    return register_all(
+        server,
+        ((execute_python, "blender.execute_python", EXECUTE_PYTHON_DESCRIPTION),),
+        enabled,
+    )

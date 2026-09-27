@@ -9,6 +9,7 @@ a vision model can close the loop without changing the tool contract.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -16,7 +17,7 @@ from mcp.server.mcpserver.context import Context
 
 from server.blender.protocol import Action
 from server.errors import BlenderMCPError
-from server.mcp.support import bridge_of, register, settings_of, tool_error
+from server.mcp.support import bridge_of, register_all, settings_of, tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -68,5 +69,5 @@ async def render(
         raise tool_error(exc) from exc
 
 
-def register_tools(server: MCPServer) -> None:
-    register(server, render, "blender.render", RENDER_DESCRIPTION)
+def register_tools(server: MCPServer, enabled: Callable[[str], bool] | None = None) -> list[str]:
+    return register_all(server, ((render, "blender.render", RENDER_DESCRIPTION),), enabled)

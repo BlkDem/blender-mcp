@@ -9,6 +9,22 @@ from server.config import Settings
 from server.mcp.support import AppContext
 
 
+class FakeInstances:
+    """Stands in for the bridge's instance registry."""
+
+    def __init__(self, described: dict[str, Any] | None = None) -> None:
+        self.described = described or {
+            "active": {"id": "blender-4242", "status": "active", "pid": 4242},
+            "takeover_allowed": False,
+            "instance_count": 1,
+            "instances": [{"id": "blender-4242", "status": "active", "pid": 4242}],
+            "note": "Only the active instance receives tool calls.",
+        }
+
+    def describe(self) -> dict[str, Any]:
+        return self.described
+
+
 class FakeBridge:
     """Stands in for :class:`server.blender.connection.BlenderBridge`.
 
@@ -22,6 +38,7 @@ class FakeBridge:
         self.calls: list[tuple[Action, dict[str, Any]]] = []
         self.raise_for: dict[Action, Exception] = {}
         self.timeouts: list[float | None] = []
+        self.instances = FakeInstances()
 
     async def request(
         self,

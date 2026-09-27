@@ -7,6 +7,7 @@ can act on. Blender's own behaviour is covered by the add-on, not here.
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -15,10 +16,27 @@ from mcp.server.mcpserver.exceptions import ToolError
 from server.blender.protocol import Action
 from server.config import Settings
 from server.errors import BlenderMCPError, ErrorCode
-from server.mcp.tools import objects, python, render, scene, transactions
+from server.mcp.tools import (
+    instances,
+    objects,
+    preview,
+    python,
+    render,
+    scene,
+    transactions,
+    watch,
+)
 from tests.support.stubs import FakeBridge, FakeContext
 
 pytestmark = pytest.mark.anyio
+
+
+#: The smallest valid PNG there is: 1x1, transparent.
+_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+    "01f15c4890000000a49444154789c6300010000050001"
+    "0d0a2db40000000049454e44ae426082"
+)
 
 
 def error_payload(message: str) -> str:
@@ -32,8 +50,21 @@ async def test_get_scene(ctx: FakeContext, bridge: FakeBridge) -> None:
     bridge.results[Action.GET_SCENE] = {"scene": "Scene", "objects_count": 2}
     result = await scene.get_scene(ctx)
 
-    assert bridge.calls == [(Action.GET_SCENE, {})]
+    assert bridge.calls == [(Action.GET_SCENE, {"object_limit": 200})]
     assert result == {"scene": "Scene", "objects_count": 2}
+
+
+async def test_get_scene_passes_the_object_limit(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await scene.get_scene(ctx, object_limit=10)
+    assert bridge.calls[0][1]["object_limit"] == 10
+
+
+@pytest.mark.parametrize("given,sent", [(99999, 1000), (0, 1), (-4, 1), ("x", 200)])
+async def test_get_scene_clamps_the_object_limit(
+    ctx: FakeContext, bridge: FakeBridge, given: object, sent: int
+) -> None:
+    await scene.get_scene(ctx, object_limit=given)  # type: ignore[arg-type]
+    assert bridge.calls[0][1]["object_limit"] == sent
 
 
 async def test_get_scene_reports_not_connected(ctx: FakeContext, bridge: FakeBridge) -> None:
@@ -454,3 +485,194 @@ async def test_update_object_error_message_lists_the_new_fields(ctx: FakeContext
     message = error_payload(excinfo.value.args[0])["error"]["message"]
     assert "new_name" in message
     assert "material" in message
+
+
+# --- render_preview ---------------------------------------------------------
+
+
+async def test_render_preview_sends_a_square_edge(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await preview.render_preview(ctx, max_edge=256)
+    assert bridge.calls == [(Action.RENDER_PREVIEW, {"resolution_x": 256, "resolution_y": 256})]
+
+
+@pytest.mark.parametrize("given,sent", [(8, 64), (99999, preview.MAX_PREVIEW_EDGE), (512, 512)])
+async def test_render_preview_clamps_the_edge(
+    ctx: FakeContext, bridge: FakeBridge, given: int, sent: int
+) -> None:
+    await preview.render_preview(ctx, max_edge=given)
+    assert bridge.calls[0][1]["resolution_x"] == sent
+
+
+async def test_render_preview_passes_optional_overrides(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await preview.render_preview(ctx, engine="BLENDER_EEVEE_NEXT", samples=8)
+    params = bridge.calls[0][1]
+    assert params["engine"] == "BLENDER_EEVEE_NEXT"
+    assert params["samples"] == 8
+
+
+async def test_render_preview_returns_the_image_alongside_the_summary(
+    ctx: FakeContext, bridge: FakeBridge, tmp_path
+) -> None:
+    png = tmp_path / "preview.png"
+    png.write_bytes(_PNG)
+    bridge.results[Action.RENDER_PREVIEW] = {
+        "success": True,
+        "output_path": str(png),
+        "render_time": 0.5,
+    }
+
+    blocks = await preview.render_preview(ctx)
+
+    summary = json.loads(blocks[0].text)
+    assert summary["output_path"] == str(png)
+    assert blocks[1].type == "image"
+    assert blocks[1].mime_type == "image/png"
+    assert base64.b64decode(blocks[1].data) == _PNG
+
+
+async def test_render_preview_can_be_asked_not_to_return_the_image(
+    ctx: FakeContext, bridge: FakeBridge, tmp_path
+) -> None:
+    png = tmp_path / "preview.png"
+    png.write_bytes(_PNG)
+    bridge.results[Action.RENDER_PREVIEW] = {"success": True, "output_path": str(png)}
+    blocks = await preview.render_preview(ctx, include_image=False)
+    assert [block.type for block in blocks] == ["text"]
+
+
+async def test_render_preview_says_so_when_the_image_is_missing(ctx: FakeContext, bridge: FakeBridge) -> None:
+    """A text-only answer that looks successful is the failure mode worth avoiding."""
+    bridge.results[Action.RENDER_PREVIEW] = {
+        "success": True,
+        "output_path": "/nowhere/preview.png",
+    }
+    blocks = await preview.render_preview(ctx)
+    assert "could not be read" in blocks[1].text
+
+
+async def test_render_preview_reports_a_bridge_failure(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.raise_for[Action.RENDER_PREVIEW] = BlenderMCPError("Cycles is missing")
+    with pytest.raises(ToolError) as excinfo:
+        await preview.render_preview(ctx)
+    assert error_payload(excinfo.value.args[0])["error"]["message"] == "Cycles is missing"
+
+
+# --- wait_for_change --------------------------------------------------------
+
+
+async def test_wait_for_change_returns_when_the_timeout_passes(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 7}
+    bridge.results[Action.CHANGES] = {"success": True, "count": 7, "changes": []}
+
+    blocks = await watch.wait_for_change(ctx, timeout=0.2)
+
+    payload = json.loads(blocks[0].text)
+    assert payload["changed"] is False
+    assert payload["changes"] == 0
+    assert payload["changed_objects"] == []
+    assert payload["waited"] >= 0
+    assert payload["watched"] == "scene"
+
+
+async def test_wait_for_change_returns_what_changed(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 7}
+    bridge.results[Action.CHANGES] = {
+        "success": True,
+        "count": 9,
+        "changes": [
+            {"index": 7, "action": "update_object", "names": ["Cube"]},
+            {"index": 8, "action": "manual", "names": ["Sphere", "Cube"]},
+        ],
+    }
+
+    blocks = await watch.wait_for_change(ctx, timeout=5)
+    payload = json.loads(blocks[0].text)
+    assert payload["changed"] is True
+    assert payload["changes"] == 2
+    assert payload["changed_objects"] == ["Cube", "Sphere"]
+
+
+async def test_wait_for_change_can_watch_one_object(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 0}
+    bridge.results[Action.CHANGES] = {
+        "success": True,
+        "count": 1,
+        "changes": [{"index": 0, "action": "manual", "names": ["SomeoneElse"]}],
+    }
+
+    blocks = await watch.wait_for_change(ctx, timeout=0.2, objects=["Cube"])
+    payload = json.loads(blocks[0].text)
+    assert payload["changed"] is False, "a change to another object is not this object's change"
+    assert payload["changed_objects"] == []
+
+
+async def test_wait_for_change_reports_a_window_it_could_not_cover(
+    ctx: FakeContext, bridge: FakeBridge
+) -> None:
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 900}
+    bridge.results[Action.CHANGES] = {
+        "success": True,
+        "count": 900,
+        "changes": [{"index": 899, "action": "update_object", "names": ["Cube"]}],
+        "dropped": 700,
+    }
+
+    blocks = await watch.wait_for_change(ctx, timeout=1)
+    payload = json.loads(blocks[0].text)
+    assert payload["changed"] is True
+    assert "700 earlier change(s)" in payload["note"]
+
+
+async def test_wait_for_change_can_attach_the_last_render(
+    ctx: FakeContext, bridge: FakeBridge, tmp_path
+) -> None:
+    png = tmp_path / "last.png"
+    png.write_bytes(_PNG)
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 0}
+    bridge.results[Action.CHANGES] = {
+        "success": True,
+        "count": 1,
+        "changes": [{"index": 0, "action": "update_object", "names": ["Cube"]}],
+    }
+    bridge.results[Action.LAST_RENDER] = {"success": True, "exists": True, "output_path": str(png)}
+
+    blocks = await watch.wait_for_change(ctx, timeout=1, include_image=True)
+    assert [block.type for block in blocks] == ["text", "image"]
+
+
+async def test_wait_for_change_clamps_an_absurd_timeout(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.CHANGE_COUNT] = {"success": True, "count": 0}
+    bridge.results[Action.CHANGES] = {"success": True, "count": 0, "changes": []}
+    await watch.wait_for_change(ctx, timeout=10_000)
+    payload = json.loads((await watch.wait_for_change(ctx, timeout=0))[0].text)
+    assert payload["waited"] == 0.0
+
+
+# --- checkpoint and get_instances -------------------------------------------
+
+
+async def test_checkpoint_sends_its_label(ctx: FakeContext, bridge: FakeBridge) -> None:
+    bridge.results[Action.CHECKPOINT] = {"success": True, "checkpoints": ["layout", "shell"]}
+    result = await transactions.checkpoint(ctx, "shell")
+    assert bridge.calls == [(Action.CHECKPOINT, {"label": "shell"})]
+    assert result["checkpoints"] == ["layout", "shell"]
+
+
+async def test_begin_sends_a_label_only_when_given(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await transactions.begin_transaction(ctx, "layout")
+    await transactions.begin_transaction(ctx)
+    assert bridge.calls[0][1] == {"label": "layout"}
+    assert bridge.calls[1][1] == {}
+
+
+async def test_rollback_sends_a_checkpoint_only_when_given(ctx: FakeContext, bridge: FakeBridge) -> None:
+    await transactions.rollback_transaction(ctx, to="shell")
+    await transactions.rollback_transaction(ctx)
+    assert bridge.calls[0][1] == {"to": "shell"}
+    assert bridge.calls[1][1] == {}
+
+
+async def test_get_instances_describes_the_bridge_registry(ctx: FakeContext, bridge: FakeBridge) -> None:
+    described = await instances.get_instances(ctx)
+    assert "takeover_allowed" in described
+    assert "active" in described

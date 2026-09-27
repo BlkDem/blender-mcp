@@ -12,6 +12,7 @@ wrong often enough to be worth converting at the boundary.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -19,7 +20,7 @@ from mcp.server.mcpserver.context import Context
 
 from server.blender.protocol import Action
 from server.errors import BlenderMCPError
-from server.mcp.support import bridge_of, register, tool_error
+from server.mcp.support import bridge_of, register_all, tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,9 @@ Return a compact, LLM-sized summary of the active scene: object names, types,
 transforms and visibility, plus collections, cameras, lights, the active object,
 the render engine and the current frame.
 
-Use this first to see what exists. For a scene with many objects use
-blender.get_objects instead: it filters and pages, so one call cannot flood the
-context. No mesh data is included.\
+Use this first to see what exists. At most `object_limit` objects are inlined
+(200 by default); when `objects_truncated` is true, use blender.get_objects to
+page through the rest. No mesh data is included.\
 """
 
 GET_OBJECTS_DESCRIPTION = """\
@@ -55,10 +56,12 @@ Fails with OBJECT_NOT_FOUND when the name does not exist.\
 """
 
 
-async def get_scene(ctx: Context) -> dict[str, Any]:
+async def get_scene(ctx: Context, object_limit: int = 200) -> dict[str, Any]:
     """Summarise the active scene."""
     try:
-        return await bridge_of(ctx).request(Action.GET_SCENE)
+        return await bridge_of(ctx).request(
+            Action.GET_SCENE, {"object_limit": _bounded(object_limit, 1, 1000, 200)}
+        )
     except BlenderMCPError as exc:
         logger.info("blender.get_scene failed: %s", exc)
         raise tool_error(exc) from exc
@@ -108,7 +111,13 @@ async def get_object(ctx: Context, name: str) -> dict[str, Any]:
         raise tool_error(exc) from exc
 
 
-def register_tools(server: MCPServer) -> None:
-    register(server, get_scene, "blender.get_scene", GET_SCENE_DESCRIPTION)
-    register(server, get_objects, "blender.get_objects", GET_OBJECTS_DESCRIPTION)
-    register(server, get_object, "blender.get_object", GET_OBJECT_DESCRIPTION)
+def register_tools(server: MCPServer, enabled: Callable[[str], bool] | None = None) -> list[str]:
+    return register_all(
+        server,
+        (
+            (get_scene, "blender.get_scene", GET_SCENE_DESCRIPTION),
+            (get_objects, "blender.get_objects", GET_OBJECTS_DESCRIPTION),
+            (get_object, "blender.get_object", GET_OBJECT_DESCRIPTION),
+        ),
+        enabled,
+    )

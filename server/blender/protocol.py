@@ -7,6 +7,7 @@ about on its own.
 
 from __future__ import annotations
 
+import json
 import uuid
 from enum import StrEnum
 from typing import Any
@@ -28,14 +29,19 @@ class Action(StrEnum):
     GET_OBJECTS = "get_objects"
     GET_OBJECT = "get_object"
     PING = "ping"
+    CHANGE_COUNT = "change_count"
+    CHANGES = "changes"
     # mutations
     CREATE_OBJECT = "create_object"
     UPDATE_OBJECT = "update_object"
     DELETE_OBJECT = "delete_object"
     RENDER = "render"
+    RENDER_PREVIEW = "render_preview"
+    LAST_RENDER = "last_render"
     EXECUTE_PYTHON = "execute_python"
     # undo grouping
     BEGIN_TRANSACTION = "begin_transaction"
+    CHECKPOINT = "checkpoint"
     COMMIT_TRANSACTION = "commit_transaction"
     ROLLBACK_TRANSACTION = "rollback_transaction"
 
@@ -50,12 +56,27 @@ _MUTATING_ACTIONS = frozenset(
         Action.UPDATE_OBJECT,
         Action.DELETE_OBJECT,
         Action.RENDER,
+        Action.RENDER_PREVIEW,
         Action.EXECUTE_PYTHON,
         Action.BEGIN_TRANSACTION,
+        Action.CHECKPOINT,
         Action.COMMIT_TRANSACTION,
         Action.ROLLBACK_TRANSACTION,
     }
 )
+
+
+#: Server -> add-on control frame. The only frame that carries no request id.
+DISCONNECT = "disconnect"
+
+
+def encode_disconnect(reason: str) -> str:
+    """Tell the add-on to stop, and why, before the socket closes.
+
+    Without this the add-on retries a connection it will never be given, and the
+    operator panel shows a reconnect loop instead of the actual problem.
+    """
+    return json.dumps({"type": DISCONNECT, "reason": reason})
 
 
 class Request(BaseModel):

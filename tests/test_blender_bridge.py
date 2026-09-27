@@ -15,10 +15,14 @@ dispatch path is exercised but the scheduler registration is not.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
+import os
 import random
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import anyio
 import pytest
@@ -201,8 +205,67 @@ async def test_rollback_removes_the_objects_it_recorded() -> None:
                 await session.call_tool("blender.create_object", {"type": "cylinder", "name": f"Leg{index}"})
             )
         rolled = payload_of(await session.call_tool("blender.rollback_transaction", {}))
-    assert rolled["undo_steps"] == 3
+    assert rolled["restored"] == 3
+    assert rolled["transaction"] == "closed"
+    assert rolled["checkpoint"] == "begin"
     assert set(bpy.data.objects.keys()) == {"Before"}
+
+
+async def test_a_checkpoint_rolls_back_only_the_stage_after_it() -> None:
+    async with stack() as (session, _):
+        await session.call_tool("blender.create_object", {"type": "cube", "name": "Before"})
+        await session.call_tool("blender.begin_transaction", {"label": "layout"})
+        await session.call_tool("blender.create_object", {"type": "cube", "name": "Shell"})
+        marked = payload_of(await session.call_tool("blender.checkpoint", {"label": "shell"}))
+        assert marked["checkpoints"] == ["layout", "shell"]
+        await session.call_tool("blender.create_object", {"type": "cube", "name": "Detail"})
+
+        rolled = payload_of(await session.call_tool("blender.rollback_transaction", {"to": "shell"}))
+        assert rolled["checkpoints"] == ["layout", "shell"]
+        assert rolled["transaction"] == "open"
+        assert set(bpy.data.objects.keys()) == {"Before", "Shell"}
+        await session.call_tool("blender.commit_transaction", {})
+
+
+async def test_waiting_reports_no_change_when_the_scene_is_still() -> None:
+    async with stack() as (session, _):
+        blocks = await session.call_tool("blender.wait_for_change", {"timeout": 0.2})
+    payload = json.loads(blocks.content[0].text)
+    assert payload["changed"] is False
+    assert payload["changes"] == 0
+    assert payload["waited"] < 2.0
+
+
+async def test_waiting_returns_as_soon_as_something_changes() -> None:
+    async with stack() as (session, _):
+        await session.call_tool("blender.create_object", {"type": "cube", "name": "Later"})
+
+        async def change_soon() -> None:
+            await asyncio.sleep(0.15)
+            await session.call_tool("blender.create_object", {"type": "cube", "name": "Trigger"})
+
+        asyncio.create_task(change_soon())
+        blocks = await session.call_tool("blender.wait_for_change", {"timeout": 5})
+    payload = json.loads(blocks.content[0].text)
+    assert payload["changed"] is True
+    assert "Trigger" in payload["changed_objects"]
+    assert payload["waited"] < 4.0
+
+
+async def test_get_instances_reports_the_attached_blender() -> None:
+    async with stack() as (session, _):
+        with anyio.fail_after(10.0):
+            # The socket is up before the identity handshake finishes, so the
+            # first answers can legitimately report nothing yet.
+            while True:
+                payload = payload_of(await session.call_tool("blender.get_instances", {}))
+                if payload["active"] is not None:
+                    break
+                await anyio.sleep(0.02)
+    assert payload["takeover_allowed"] is False
+    assert payload["active"]["status"] == "active"
+    assert payload["active"]["pid"] > 0
+    assert payload["active"]["blender_version"]
 
 
 async def test_resources_read_the_real_scene() -> None:
@@ -213,6 +276,100 @@ async def test_resources_read_the_real_scene() -> None:
         objects = json.loads((await session.read_resource("blender://objects")).contents[0].text)
     assert scene["objects_count"] == 2
     assert sorted(obj["name"] for obj in objects["objects"]) == ["A", "B"]
+
+
+async def add_camera(session: ClientSession) -> None:
+    """An empty file has no camera, and Blender refuses to render without one.
+
+    Cycles on the CPU, because the default engine is EEVEE and EEVEE needs a
+    GPU context that the ``bpy`` module does not have: asking for it aborts the
+    process rather than raising.
+    """
+    payload_of(
+        await session.call_tool(
+            "blender.execute_python",
+            {
+                "code": (
+                    "import bpy\n"
+                    "bpy.context.scene.render.engine = 'CYCLES'\n"
+                    "bpy.context.scene.cycles.device = 'CPU'\n"
+                    "data = bpy.data\n"
+                    "camera = data.cameras.new('PreviewCamera')\n"
+                    "obj = data.objects.new('PreviewCamera', camera)\n"
+                    "bpy.context.scene.collection.objects.link(obj)\n"
+                    "obj.location = (0, -6, 2)\n"
+                    "obj.rotation_euler = (1.2, 0, 0)\n"
+                    "bpy.context.scene.camera = obj\n"
+                    "light = data.lights.new('PreviewSun', 'SUN')\n"
+                    "sun = data.objects.new('PreviewSun', light)\n"
+                    "bpy.context.scene.collection.objects.link(sun)\n"
+                    "sun.rotation_euler = (0.9, 0.2, 0.4)\n"
+                    "result = 'ready'"
+                )
+            },
+        )
+    )
+
+
+async def test_render_preview_comes_back_as_an_image() -> None:
+    """The point of the preview: a picture, not a path the model cannot open."""
+    async with stack() as (session, _):
+        await add_camera(session)
+        await session.call_tool("blender.create_object", {"type": "cube", "name": "Subject"})
+        blocks = await session.call_tool(
+            "blender.render_preview", {"max_edge": 64, "engine": "CYCLES", "samples": 1}
+        )
+
+    summary = json.loads(blocks.content[0].text)
+    assert summary["success"] is True
+    assert [block.type for block in blocks.content] == ["text", "image"]
+    image = blocks.content[1]
+    assert image.mime_type == "image/png"
+    assert base64.b64decode(image.data).startswith(b"\x89PNG")
+    assert os.path.isfile(summary["output_path"])
+
+
+async def test_the_last_render_resource_serves_that_image() -> None:
+    async with stack() as (session, _):
+        await add_camera(session)
+        rendered = payload_of(
+            await session.call_tool(
+                "blender.render",
+                {
+                    "resolution_x": 64,
+                    "resolution_y": 64,
+                    "engine": "CYCLES",
+                    "samples": 1,
+                },
+            )
+        )
+        latest = await session.read_resource("blender://render/latest")
+    assert latest.contents[0].mime_type == "image/png"
+    assert base64.b64decode(latest.contents[0].blob) == Path(rendered["output_path"]).read_bytes()
+
+
+async def test_opening_another_file_drops_the_remembered_render(tmp_path) -> None:
+    """A render belongs to the scene it was made in.
+
+    Keeping it would mean serving one file's picture as the "latest render" of
+    another, which is worse than saying there is none.
+    """
+    async with stack() as (session, _):
+        await add_camera(session)
+        first_file = str(tmp_path / "first.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=first_file)
+        await session.call_tool("blender.render", {"engine": "CYCLES", "samples": 1})
+        assert (await session.read_resource("blender://render/latest")).contents[0].blob
+
+        # ``save_as_mainfile(copy=True)`` writes the copy but keeps the current
+        # file, so open it to actually be in a different one.
+        second_file = str(tmp_path / "second.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=second_file, copy=True)
+        bpy.ops.wm.open_mainfile(filepath=second_file)
+        assert bpy.data.filepath == second_file
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011 - SDK error type varies
+            await session.read_resource("blender://render/latest")
+    assert "no longer open" in str(excinfo.value)
 
 
 async def test_a_build_a_table_chain_from_the_readme() -> None:

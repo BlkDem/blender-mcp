@@ -14,17 +14,26 @@ from typing import Any
 
 PROTOCOL_VERSION = 1
 
+#: Server -> add-on control frame. Everything else on this socket is a
+#: request/response pair; this is the one frame that carries no request id.
+DISCONNECT = "disconnect"
+
 # --- actions ----------------------------------------------------------------
 GET_SCENE = "get_scene"
 GET_OBJECTS = "get_objects"
 GET_OBJECT = "get_object"
 PING = "ping"
+CHANGE_COUNT = "change_count"
+CHANGES = "changes"
 CREATE_OBJECT = "create_object"
 UPDATE_OBJECT = "update_object"
 DELETE_OBJECT = "delete_object"
 RENDER = "render"
+RENDER_PREVIEW = "render_preview"
+LAST_RENDER = "last_render"
 EXECUTE_PYTHON = "execute_python"
 BEGIN_TRANSACTION = "begin_transaction"
+CHECKPOINT = "checkpoint"
 COMMIT_TRANSACTION = "commit_transaction"
 ROLLBACK_TRANSACTION = "rollback_transaction"
 
@@ -35,8 +44,10 @@ MUTATING_ACTIONS = frozenset(
         UPDATE_OBJECT,
         DELETE_OBJECT,
         RENDER,
+        RENDER_PREVIEW,
         EXECUTE_PYTHON,
         BEGIN_TRANSACTION,
+        CHECKPOINT,
         COMMIT_TRANSACTION,
         ROLLBACK_TRANSACTION,
     }
@@ -104,6 +115,28 @@ class ActionError(Exception):
 
 def new_request_id() -> str:
     return uuid.uuid4().hex
+
+
+def encode_disconnect(reason: str) -> str:
+    """Tell the add-on to stop, and why, before the socket is closed."""
+    return json.dumps({"type": DISCONNECT, "reason": reason})
+
+
+def parse_disconnect(raw: str) -> str | None:
+    """The reason in a ``disconnect`` control frame, or ``None`` for anything else.
+
+    Returns ``None`` rather than raising for every other frame: the add-on's read
+    loop already has its own error handling for requests, and a control frame
+    that does not parse is just a request.
+    """
+    try:
+        frame = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(frame, dict) and frame.get("type") == DISCONNECT:
+        reason = frame.get("reason")
+        return str(reason) if reason else "the server closed the connection"
+    return None
 
 
 def encode_response(request_id: str, result: dict[str, Any] | None = None, *, success: bool = True) -> str:

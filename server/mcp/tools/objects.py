@@ -14,6 +14,7 @@ silent rename is.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -22,7 +23,7 @@ from pydantic import Field
 
 from server.blender.protocol import Action
 from server.errors import BlenderMCPError, ErrorCode
-from server.mcp.support import bridge_of, register, tool_error
+from server.mcp.support import bridge_of, register_all, tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +241,13 @@ async def delete_object(ctx: Context, name: str) -> dict[str, Any]:
         raise tool_error(exc) from exc
 
 
-def register_tools(server: MCPServer) -> None:
-    register(server, create_object, "blender.create_object", CREATE_OBJECT_DESCRIPTION)
-    register(server, update_object, "blender.update_object", UPDATE_OBJECT_DESCRIPTION)
-    register(server, delete_object, "blender.delete_object", DELETE_OBJECT_DESCRIPTION)
+def register_tools(server: MCPServer, enabled: Callable[[str], bool] | None = None) -> list[str]:
+    return register_all(
+        server,
+        (
+            (create_object, "blender.create_object", CREATE_OBJECT_DESCRIPTION),
+            (update_object, "blender.update_object", UPDATE_OBJECT_DESCRIPTION),
+            (delete_object, "blender.delete_object", DELETE_OBJECT_DESCRIPTION),
+        ),
+        enabled,
+    )

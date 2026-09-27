@@ -22,7 +22,7 @@ import functools
 import inspect
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
@@ -185,10 +185,46 @@ def _format(fields: dict[str, Any]) -> str:
     )
 
 
-def register(server: MCPServer, fn: F, name: str, description: str) -> None:
+def register(
+    server: MCPServer,
+    fn: F,
+    name: str,
+    description: str,
+    *,
+    structured_output: bool = True,
+) -> None:
     """Register a tool under an explicit, dotted name, with request logging.
 
     ``functools.wraps`` keeps the wrapper's signature identical to the original,
     which is what the SDK reads to build the tool's JSON schema.
+
+    ``structured_output=False`` is for a tool whose return value is a list of
+    content blocks — an image, say — where there is no single JSON object to
+    describe as a schema.
     """
-    server.add_tool(_instrument(name, fn), name=name, description=description, structured_output=True)
+    server.add_tool(
+        _instrument(name, fn),
+        name=name,
+        description=description,
+        structured_output=structured_output,
+    )
+
+
+def register_all(
+    server: MCPServer,
+    tools: Iterable[tuple[F, str, str]],
+    enabled: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """Register ``(fn, name, description)`` triples, honouring the allowlist.
+
+    Every tool module funnels through here so ``ENABLED_TOOLS`` is honoured in
+    one place and a module cannot forget to.
+    """
+    allow = enabled or (lambda _name: True)
+    skipped: list[str] = []
+    for fn, name, description in tools:
+        if allow(name):
+            register(server, fn, name, description)
+        else:
+            skipped.append(name)
+    return skipped

@@ -13,6 +13,7 @@ import json
 import random
 import socket
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -38,6 +39,27 @@ def free_port() -> int:
     return next(_next_port)
 
 
+async def wait_for(predicate: Callable[[], Any], timeout: float = 5.0) -> bool:
+    """Wait for something a background socket thread has to do."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+#: What a real add-on answers to the identity ping the bridge sends on connect.
+IDENTITY: dict[str, Any] = {
+    "success": True,
+    "pong": True,
+    "pid": 4242,
+    "blender_version": "4.2.0",
+    "scene": "Scene",
+    "blend_file": None,
+}
+
+
 class Peer:
     """A scripted protocol peer with no Blender behind it.
 
@@ -45,12 +67,28 @@ class Peer:
     every inbound request to ``respond``, which returns the frame to send back
     or ``None`` to stay silent. Silence is how the timeout and disconnect cases
     are provoked.
+
+    The bridge identifies a peer before handing it the socket, so the ping is
+    answered here by default and kept out of ``requests``: a test asking what the
+    bridge sent means the request it made, not the handshake. Pass
+    ``answer_ping=False`` to see the handshake too, or ``identity`` to pretend to
+    be a particular Blender.
     """
 
-    def __init__(self, ws: WebSocket, respond: Callable[[dict[str, Any]], str | None]) -> None:
+    def __init__(
+        self,
+        ws: WebSocket,
+        respond: Callable[[dict[str, Any]], str | None],
+        *,
+        identity: dict[str, Any] | None = None,
+        answer_ping: bool = True,
+    ) -> None:
         self.ws = ws
         self._respond = respond
+        self.identity = dict(IDENTITY if identity is None else identity)
+        self.answer_ping = answer_ping
         self.requests: list[dict[str, Any]] = []
+        self.control: list[dict[str, Any]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -74,10 +112,29 @@ class Peer:
             if raw is None:
                 return
             message = json.loads(raw)
+            if message.get("type") == "disconnect":
+                # A server-side refusal, carrying the reason Blender would show.
+                self.control.append(message)
+                return
+            if self.answer_ping and message.get("action") == "ping":
+                self._send(encode_response(message["id"], self.identity))
+                continue
             self.requests.append(message)
             answer = self._respond(message)
             if answer is not None:
-                self.ws.send(answer)
+                self._send(answer)
+
+    def _send(self, frame: str) -> None:
+        """Answer, unless the bridge has already hung up on us.
+
+        Racy on purpose: a refusal closes the socket while the identity ping may
+        still be in flight, and a thread that raises on shutdown would turn a
+        passing test into a warning.
+        """
+        try:
+            self.ws.send(frame)
+        except (WebSocketClosed, WebSocketError, OSError):
+            return
 
 
 def constant(result: dict[str, Any]) -> Callable[[dict[str, Any]], str]:
@@ -94,9 +151,19 @@ def silent(_: dict[str, Any]) -> None:
 class AddonStub(Peer):
     """A :class:`Peer` that always answers with the same payload."""
 
-    def __init__(self, ws: WebSocket, result: dict[str, Any] | None = None, *, respond: bool = True) -> None:
+    def __init__(
+        self,
+        ws: WebSocket,
+        result: dict[str, Any] | None = None,
+        *,
+        respond: bool = True,
+        identity: dict[str, Any] | None = None,
+        answer_ping: bool = True,
+    ) -> None:
         payload = {"success": True, "stub": True} if result is None else result
-        super().__init__(ws, constant(payload) if respond else silent)
+        super().__init__(
+            ws, constant(payload) if respond else silent, identity=identity, answer_ping=answer_ping
+        )
 
 
 async def open_addon(port: int, **kwargs: Any) -> AddonStub:
@@ -105,10 +172,16 @@ async def open_addon(port: int, **kwargs: Any) -> AddonStub:
     return AddonStub(ws, **kwargs).start()
 
 
-async def open_peer(port: int, respond: Callable[[dict[str, Any]], str | None]) -> Peer:
+async def open_named_addon(port: int, pid: int, **kwargs: Any) -> AddonStub:
+    """Attach an add-on that claims to be a particular Blender process."""
+    identity = {**IDENTITY, "pid": pid}
+    return await open_addon(port, identity=identity, **kwargs)
+
+
+async def open_peer(port: int, respond: Callable[[dict[str, Any]], str | None], **kwargs: Any) -> Peer:
     """Attach a scripted peer built on the add-on's real client."""
     ws = await asyncio.to_thread(WebSocket.connect, "127.0.0.1", port, "/", 5.0)
-    return Peer(ws, respond).start()
+    return Peer(ws, respond, **kwargs).start()
 
 
 @asynccontextmanager
@@ -129,8 +202,8 @@ async def wait_until_connected(bridge: BlenderBridge, attempts: int = 150) -> No
     raise AssertionError("the add-on never registered with the bridge")
 
 
-def make_bridge(port: int, timeout: float = 5.0) -> BlenderBridge:
-    return BlenderBridge("127.0.0.1", port, request_timeout=timeout)
+def make_bridge(port: int, timeout: float = 5.0, *, allow_takeover: bool = False) -> BlenderBridge:
+    return BlenderBridge("127.0.0.1", port, request_timeout=timeout, allow_takeover=allow_takeover)
 
 
 async def echo_handler(websocket: ServerConnection) -> None:
@@ -352,16 +425,20 @@ async def test_a_malformed_frame_does_not_break_the_connection() -> None:
         seen: list[dict[str, Any]] = []
 
         def sloppy(message: dict[str, Any]) -> str:
+            if message.get("action") == "ping":
+                return encode_response(message["id"], IDENTITY)
             seen.append(message)
             if len(seen) == 1:
                 return "{not json"
             return encode_response(message["id"], {"recovered": True})
 
-        peer = await open_peer(port, sloppy)
+        # The script answers the identity handshake itself, so every frame the
+        # bridge gets after that is one this test provoked.
+        peer = await open_peer(port, sloppy, answer_ping=False)
         await wait_until_connected(bridge)
         # The first request times out because the answer is unparsable...
         with pytest.raises(BlenderMCPError) as first:
-            await bridge.request(Action.PING)
+            await bridge.request(Action.GET_SCENE)
         assert first.value.code is ErrorCode.TIMEOUT
         # ...and the connection is still usable afterwards.
         assert await bridge.request(Action.GET_SCENE) == {"recovered": True}
@@ -370,24 +447,129 @@ async def test_a_malformed_frame_does_not_break_the_connection() -> None:
         await bridge.stop()
 
 
-async def test_a_second_addon_takes_over_the_bridge() -> None:
+async def test_a_second_blender_is_refused_with_a_reason() -> None:
+    """A takeover is not silent: the newcomer is told why, and told to stop."""
     port = free_port()
     bridge = make_bridge(port, timeout=5.0)
     await bridge.start()
     try:
-        first = await open_addon(port, result={"which": "first"})
+        first = await open_named_addon(port, 1001, result={"which": "first"})
         await wait_until_connected(bridge)
-        second = await open_addon(port, result={"which": "second"})
+        second = await open_named_addon(port, 1002, result={"which": "second"})
+
+        assert await wait_for(lambda: second.control), "the second Blender was never told why"
+        reason = second.control[0]["reason"]
+        assert "already connected" in reason
+        assert "BLENDER_ALLOW_TAKEOVER" in reason
+
+        # The first Blender keeps the socket: its calls still land in its scene.
+        assert await bridge.request(Action.GET_SCENE) == {"which": "first"}
+        assert bridge.instances.active is not None
+        assert bridge.instances.active.pid == 1001
+
+        first.stop()
+        second.stop()
+    finally:
+        await bridge.stop()
+
+
+async def test_a_refused_blender_is_remembered_as_refused() -> None:
+    """The refusal is on the record, which is how a mystery scene gets explained."""
+    port = free_port()
+    bridge = make_bridge(port)
+    await bridge.start()
+    try:
+        first = await open_named_addon(port, 2001)
+        await wait_until_connected(bridge)
+        second = await open_named_addon(port, 2002)
+        assert await wait_for(lambda: second.control)
+
+        described = bridge.instances.describe()
+        assert described["active"] is not None
+        assert described["active"]["pid"] == 2001
+        assert described["takeover_allowed"] is False
+        statuses = {entry["id"]: entry["status"] for entry in described["instances"]}
+        assert statuses == {"blender-2001": "active", "blender-2002": "refused"}
+
+        first.stop()
+        second.stop()
+    finally:
+        await bridge.stop()
+
+
+async def test_a_reconnect_of_the_same_blender_is_not_a_takeover() -> None:
+    """Reconnecting is normal, so it is allowed; only a different process is not."""
+    port = free_port()
+    bridge = make_bridge(port, timeout=5.0)
+    await bridge.start()
+    try:
+        first = await open_named_addon(port, 3001, result={"which": "first"})
+        await wait_until_connected(bridge)
+        first.stop()
+
+        again = await open_named_addon(port, 3001, result={"which": "first-again"})
+        for _ in range(100):
+            if await bridge.request(Action.GET_SCENE) == {"which": "first-again"}:
+                break
+            await asyncio.sleep(0.05)
+        else:  # pragma: no cover - only on a very slow machine
+            pytest.fail("the same Blender could not reconnect")
+
+        assert again.control == []
+        assert bridge.instances.active is not None
+        assert bridge.instances.active.pid == 3001
+        again.stop()
+    finally:
+        await bridge.stop()
+
+
+async def test_takeover_is_allowed_when_asked_for() -> None:
+    """BLENDER_ALLOW_TAKEOVER=1 is the escape hatch for a deliberate switch."""
+    port = free_port()
+    bridge = make_bridge(port, timeout=5.0, allow_takeover=True)
+    await bridge.start()
+    try:
+        first = await open_named_addon(port, 4001, result={"which": "first"})
+        await wait_until_connected(bridge)
+        second = await open_named_addon(port, 4002, result={"which": "second"})
 
         for _ in range(100):
-            if await bridge.request(Action.PING) == {"which": "second"}:
+            if await bridge.request(Action.GET_SCENE) == {"which": "second"}:
                 break
             await asyncio.sleep(0.05)
         else:  # pragma: no cover - only on a very slow machine
             pytest.fail("the second add-on never took over")
 
+        described = bridge.instances.describe()
+        statuses = {entry["id"]: entry["status"] for entry in described["instances"]}
+        assert statuses == {"blender-4001": "replaced", "blender-4002": "active"}
+
         first.stop()
         second.stop()
+    finally:
+        await bridge.stop()
+
+
+async def test_a_peer_that_will_not_identify_is_still_accepted() -> None:
+    """A client that cannot answer the ping is anonymous, not rejected.
+
+    Scripted clients and test doubles are legitimate users of the bridge, and an
+    anonymous client cannot displace a real Blender anyway: it has no pid, so it
+    never matches an identified instance.
+    """
+    port = free_port()
+    bridge = make_bridge(port, timeout=5.0)
+    await bridge.start()
+    try:
+        peer = await open_addon(port, respond=False, answer_ping=False)
+        for _ in range(200):
+            if bridge.instances.active is None and any(
+                frame.get("action") == "ping" for frame in peer.requests
+            ):
+                break
+            await asyncio.sleep(0.05)
+        assert bridge.instances.active is None
+        peer.stop()
     finally:
         await bridge.stop()
 
@@ -425,15 +607,17 @@ async def test_the_bridge_ignores_frames_it_cannot_correlate() -> None:
         seen: list[dict[str, Any]] = []
 
         def chatty(message: dict[str, Any]) -> str:
+            if message.get("action") == "ping":
+                return encode_response(message["id"], IDENTITY)
             seen.append(message)
             if len(seen) == 1:
-                return json.dumps({"id": "wrong-id", "action": "ping", "params": {}})
+                return json.dumps({"id": "wrong-id", "action": "get_scene", "params": {}})
             return encode_response(message["id"], {"fine": True})
 
-        peer = await open_peer(port, chatty)
+        peer = await open_peer(port, chatty, answer_ping=False)
         await wait_until_connected(bridge)
         with pytest.raises(BlenderMCPError) as first:
-            await bridge.request(Action.PING)
+            await bridge.request(Action.GET_SCENE)
         assert first.value.code is ErrorCode.TIMEOUT
         assert await bridge.request(Action.GET_SCENE) == {"fine": True}
         peer.stop()

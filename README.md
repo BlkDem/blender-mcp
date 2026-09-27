@@ -58,7 +58,7 @@ will let the transport change later without touching either side.
 - [The bridge protocol](#the-bridge-protocol)
 - [Security](#security)
 - [When to use `execute_python`](#when-to-use-execute_python)
-- [Transactions and undo](#transactions-and-undo)
+- [Transactions, checkpoints and undo](#transactions-checkpoints-and-undo)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -437,7 +437,7 @@ thing, headless:
 
 ```bash
 pip install bpy==4.2.0
-pytest                          # 376 tests: 295 + 81 against real bpy
+pytest                          # 437 tests: 338 + 99 against real bpy
 BLENDER_MCP_SKIP_BPY=1 pytest   # 295, opt the real-Blender ones back out
 ```
 
@@ -478,8 +478,9 @@ needs the GUI event loop. The tests call the dispatch function directly instead
 
 | Tool | Required | Optional | What it does |
 |---|---|---|---|
-| `blender.get_scene` | — | — | Compact summary of the active scene |
+| `blender.get_scene` | — | `object_limit` | Compact summary of the active scene |
 | `blender.get_objects` | — | `type`, `collection`, `name_contains`, `limit`, `offset` | Filtered, paged object list |
+| `blender.get_instances` | — | — | Which Blender this server is attached to, and what happened to the others |
 
 ### Object
 
@@ -495,15 +496,18 @@ needs the GUI event loop. The tests call the dispatch function directly instead
 | Tool | Required | Optional | What it does |
 |---|---|---|---|
 | `blender.render` | — | `engine`, `resolution_x`, `resolution_y`, `samples`, `output_path` | Render the scene |
+| `blender.render_preview` | — | `max_edge`, `engine`, `samples`, `include_image` | Small render, returned as an image |
+| `blender.wait_for_change` | — | `timeout`, `objects`, `include_image` | Wait until something changes, or time out |
 | `blender.execute_python` | `code` | — | Run Python inside Blender; a power-user escape hatch, not the normal path |
 
 ### Undo grouping
 
 | Tool | Required | Optional | What it does |
 |---|---|---|---|
-| `blender.begin_transaction` | — | — | Start an undo group |
+| `blender.begin_transaction` | — | `label` | Start a transaction |
+| `blender.checkpoint` | `label` | — | Name a point a later rollback can stop at |
 | `blender.commit_transaction` | — | — | Keep the changes |
-| `blender.rollback_transaction` | — | — | Undo everything since `begin` |
+| `blender.rollback_transaction` | — | `to` | Undo the transaction, or just the stage after a checkpoint |
 
 `create_object` accepts `cube`, `sphere`, `cylinder`, `cone`, `plane` and
 `torus`, in any case. The enum is in the tool's JSON schema, so a model cannot
@@ -521,6 +525,49 @@ there are hundreds of objects, because it filters and pages:
 
 `total` is the number of matches before paging and `truncated` says whether more
 remain, so a model can tell that it has seen everything without guessing.
+
+`get_scene` sends an object list too, capped at `object_limit` (200 by default,
+1000 at most) and saying so with `objects_shown` and `objects_truncated`. A
+scene with ten thousand objects is a few hundred KB of JSON; a model that wants
+the rest asks for it with `get_objects` instead of having it forced on every
+scene read.
+
+### Looking at what you built
+
+`blender.render_preview` renders small and returns the image itself, so a
+vision-capable model can check its own work:
+
+```json
+{"success": true, "output_path": "/tmp/blender/preview.png", "render_time": 0.42}
+```
+
+followed by a PNG content block. It is capped at 2048 px on the long edge and
+defaults to 512, because a render is expensive in time and an image is
+expensive in context. `blender.render` is still the tool for the picture the
+user will keep.
+
+One path caveat, because it is a trap: the add-on and the MCP server have to
+share a filesystem for a *path* to mean anything. Normally they do. If you run
+Blender on Windows and the server in WSL — or the other way round — a path the
+server sends is a path the other side cannot resolve, and a render fails with
+"cannot save". `render_preview` and `blender://render/latest` avoid the problem
+by using Blender's own temp directory, because the add-on names the file and
+reports the absolute path back. The images work across that boundary; an
+explicit `output_path` does not.
+
+`blender.wait_for_change` is the companion: after a change you are unsure about,
+wait instead of re-reading the whole scene. It returns as soon as Blender
+reports a change, and tells you which objects changed:
+
+```json
+{"changed": true, "changes": 2, "waited": 0.3, "changed_objects": ["Cube"], "watched": "scene"}
+```
+
+It notices edits the *user* makes in the UI as well as the ones the tools make,
+because a user dragging an object is the most common reason to need a second
+look. It is a long poll rather than a push: this SDK can only publish
+`notifications/resources/updated` from inside a request, and a client that
+wants to be told something changed gets the same answer either way.
 
 ### Examples
 
@@ -649,6 +696,13 @@ Resources are for state you want without spending a tool call.
 |---|---|---|
 | `blender://scene` | `application/json` | Scene name, object list with transforms, collections, cameras, lights, render settings |
 | `blender://objects` | `application/json` | The same object list, ready to quote |
+| `blender://render/latest` | `image/png` | The most recent render, as image bytes |
+
+`blender://render/latest` is empty until something has been rendered, and it
+reports "no rendered image" rather than inventing one. It also stops offering a
+render once the file it was made in has been closed: the picture belongs to that
+scene, and serving it under a caption it does not match is worse than serving
+nothing.
 
 ```json
 // blender://objects
@@ -809,22 +863,33 @@ Error:
 
 | Action | Kind | Params |
 |---|---|---|
-| `get_scene` | read | `include_objects`, `include_details` |
+| `get_scene` | read | `object_limit` |
 | `get_objects` | read | `type`, `collection`, `name_contains`, `limit`, `offset` |
 | `get_object` | read | `name` |
-| `ping` | read | — |
+| `ping` | read | — (the answer carries the pid, version and file: the add-on's identity) |
+| `change_count` | read | — |
+| `changes` | read | `since` |
 | `create_object` | write | `type`, `name`, `location`, `rotation`, `scale`, `collection` |
 | `update_object` | write | `name` + any of `location`, `rotation`, `scale`, `dimensions`, `visibility`, `new_name`, `material`, `material_color` |
 | `delete_object` | write | `name` |
 | `render` | write | `engine`, `resolution_x`, `resolution_y`, `resolution_percentage`, `samples`, `output_path` |
+| `render_preview` | write | `resolution_x`, `resolution_y`, `engine`, `samples` |
+| `last_render` | read | — |
 | `execute_python` | write | `code` |
-| `begin_transaction` | write | — |
+| `begin_transaction` | write | `label` |
+| `checkpoint` | write | `label` |
 | `commit_transaction` | write | — |
-| `rollback_transaction` | write | — |
+| `rollback_transaction` | write | `to` |
 
 "write" means it pushes an undo step. Adding an action means adding an entry
 here, a handler in `addon/blender_mcp/operators.py`, and — if the model should
-see it — a tool in `server/mcp/tools/`.
+see it — a tool in `server/mcp/tools/`. The two protocol modules mirror each
+other field for field, and `tests/test_addon_protocol.py` fails if they drift.
+
+There is one frame that is not a request: `{"type": "disconnect", "reason": …}`,
+which the server sends to refuse a Blender that is not the one already attached.
+It is how a refusal reaches the add-on instead of leaving it retrying a
+connection it will never be given.
 
 ### Failure handling on the wire
 
@@ -853,6 +918,38 @@ Read this before pointing anything other than your own machine at this server.
   has none of its own.
 * **There is no auth, no multi-user support and no audit trail** beyond the
   request log. That is deliberate for a local tool, not an oversight.
+
+### One Blender at a time
+
+The bridge serves one Blender. A second one connecting is **refused by default**,
+with the reason sent to the add-on so its panel says why instead of retrying
+forever:
+
+```text
+blender-4711 (pid 4711) is already connected. Close it, or start the server
+with BLENDER_ALLOW_TAKEOVER=1 if you meant to replace it.
+```
+
+The alternative — letting the newcomer take the socket — is the failure mode
+this prevents: one user's tool calls quietly start landing in someone else's
+scene, and the symptom is impossible to trace back. Both instances are recorded
+either way, so `blender.get_instances` can explain a scene that changed
+unexpectedly:
+
+```json
+{
+  "active": {"id": "blender-4711", "status": "active", "pid": 4711, "blender_version": "5.2.2"},
+  "takeover_allowed": false,
+  "instances": [
+    {"id": "blender-4711", "status": "active"},
+    {"id": "blender-4822", "status": "refused", "reason": "..."}
+  ]
+}
+```
+
+A reconnect of the *same* process is not a takeover and is allowed: the pid
+identifies the instance, so a dropped socket is not mistaken for a second
+Blender.
 
 ### If you must expose it
 
@@ -912,26 +1009,47 @@ If a model is writing Blender Python for something a tool could do, that is a ga
 in the tools, not a reason to reach for step 5. The tools return compact,
 predictable JSON and push an undo step; a Python snippet can do neither for you.
 
-## Transactions and undo
+## Transactions, checkpoints and undo
 
 Every mutating action pushes one Blender undo step, so a user can always step
-back manually.
+back by hand.
 
-On top of that, three tools group a sequence:
+On top of that, four tools group a sequence:
 
 ```text
-blender.begin_transaction    → one undo step, start counting
-  …mutating calls…           → each pushes a step, each is counted
-blender.commit_transaction   → close the group, keep the changes
-blender.rollback_transaction → replay exactly the recorded number of undos
+blender.begin_transaction    → start recording
+  …mutating calls…           → each object's state is captured before it changes
+blender.checkpoint "shell"   → name a point in the middle
+  …more calls…
+blender.commit_transaction   → close it, keep the changes
+blender.rollback_transaction → put everything back, or only what came after "shell"
 ```
 
-This is why undo was built in from the start rather than retrofitted: an AI
-building a scene touches a dozen objects in a row, and a single
-`rollback_transaction` is far more useful to it than twelve deletions.
+Rollback restores recorded state — transforms, names, visibility, materials,
+collection membership — rather than replaying undo steps. That distinction
+matters: Blender's undo history is not readable from Python, so a count of steps
+is only right if nothing else touched the undo stack, and a user clicking around
+mid-transaction breaks that assumption. Restoring recorded state is exact for
+what the tools changed, whatever the user does in between. The undo steps stay
+on the stack for the human.
 
-The caveat is honest: the count assumes no manual edit happened in the Blender UI
-while a transaction was open. Keep transactions short.
+A checkpoint splits a transaction into stages, which is what a build with
+phases needs:
+
+```text
+begin "layout"
+  build the shell
+checkpoint "shell"
+  add the details
+rollback to="shell"   → the details go, the shell stays, the transaction stays open
+```
+
+The limits, stated plainly: edits made through `blender.execute_python` are not
+recorded, so a transaction containing them restores only its tool calls — the
+rollback result says so in a `note` field rather than pretending otherwise. And
+an object deleted by a tool can be brought back, but only while its mesh data
+still exists; if Blender has purged it, the object comes back empty and the
+rollback result lists it under `unrecoverable`.
 
 ## Configuration
 
@@ -949,12 +1067,25 @@ a `.env` file next to the server. See `.env.example`.
 | `BLENDER_CONNECT_TIMEOUT` | `5.0` | Socket connect timeout used by the add-on |
 | `BLENDER_RENDER_TIMEOUT` | `600.0` | Seconds to wait for a render |
 | `ALLOW_PYTHON_EXECUTION` | `false` | Gate for `blender.execute_python` |
+| `BLENDER_ALLOW_TAKEOVER` | `false` | Let a newly connected Blender replace the attached one |
+| `ENABLED_TOOLS` | all | Comma-separated allowlist of tool names |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `LOG_FORMAT` | see `.env.example` | `logging` format string |
 
 Names are explicit about scope on purpose: `BLENDER_REQUEST_TIMEOUT` is the wait
 for a *Blender* response, `BLENDER_RENDER_TIMEOUT` is the longer one a render
 needs, and `MCP_PORT` only matters if you switch away from stdio.
+
+`ENABLED_TOOLS` is for narrowing the surface, not for switching things on:
+
+```bash
+ENABLED_TOOLS=blender.get_scene,blender.get_objects,blender.get_object,blender.create_object
+```
+
+Read-only tools stay available whatever the list says, because a client that
+cannot read the scene cannot do anything sensible with it. An unknown name in
+the list is refused at startup rather than ignored, so a typo does not quietly
+remove a tool you meant to keep.
 
 ```text
 2026-09-27 12:30:21 INFO server.mcp.support: mcp tool=blender.create_object request=7 duration_ms=41.8 success=true
@@ -993,7 +1124,7 @@ blender-mcp/
 │   │   ├── server.py            # assembles tools, resources, lifespan
 │   │   ├── support.py           # AppContext: how a tool reaches the bridge
 │   │   ├── tools/               # scene, objects, render, python, transactions
-│   │   └── resources/           # blender://scene, blender://objects
+│   │   └── resources/           # blender://scene, objects, render/latest
 │   ├── blender/                 # the transport
 │   │   ├── protocol.py          # pydantic request/response models
 │   │   ├── client.py            # one connection, request/response correlation
@@ -1010,7 +1141,7 @@ blender-mcp/
 │   ├── executor.py              # executes model-written code
 │   └── ui.py                    # N-panel and its operators
 │
-├── tests/                       # pytest; 376 tests (295 without bpy)
+├── tests/                       # pytest; 437 tests (338 without bpy)
 │   └── support/                 # protocol double, stubs, the bpy gate
 │
 ├── examples/                    # bridge scripts, acceptance checks, GUI demo

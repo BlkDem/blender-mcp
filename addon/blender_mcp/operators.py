@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
@@ -33,6 +34,23 @@ SUPPORTED_TYPES: tuple[str, ...] = ("cube", "sphere", "cylinder", "cone", "plane
 #: Hard cap on one ``get_objects`` page. A scene with thousands of objects must
 #: not be able to fill an LLM context, whatever limit it asks for.
 MAX_LIST_LIMIT = 500
+
+#: Default and ceiling for how many objects ``get_scene`` inlines. Past a few
+#: hundred the summary stops being a summary and starts being the whole scene in
+#: the model's context; ``get_objects`` is the tool for going deeper.
+DEFAULT_SCENE_OBJECT_LIMIT = 200
+MAX_SCENE_OBJECT_LIMIT = 1000
+
+#: Preview renders exist to be looked at, not admired: small, few samples, and
+#: always at the same path so ``blender://render/latest`` has something to serve.
+DEFAULT_PREVIEW_RESOLUTION = 512
+MAX_PREVIEW_RESOLUTION = 1024
+DEFAULT_PREVIEW_SAMPLES = 16
+PREVIEW_FILENAME = "mcp_render_preview.png"
+
+#: The most recent render, for ``blender://render/latest``. Module-level because
+#: the add-on is a singleton inside one Blender; there is nothing to share it with.
+_LAST_RENDER: dict[str, Any] = {"result": None, "at": 0.0}
 
 #: Fallback operators, used only if a bmesh primitive cannot be built.
 #: ``bpy.ops`` needs a live window context, which the main-thread timer has in
@@ -222,9 +240,19 @@ def get_scene(params: dict[str, Any] | None = None) -> dict[str, Any]:
         "render_engine": scene.render.engine,
     }
     if include_objects:
+        limit = min(
+            max(1, int(params.get("object_limit", DEFAULT_SCENE_OBJECT_LIMIT))),
+            MAX_SCENE_OBJECT_LIMIT,
+        )
+        shown = objects[:limit]
         payload["objects"] = [
-            _object_detail(obj) if include_details else _object_summary(obj) for obj in objects
+            _object_detail(obj) if include_details else _object_summary(obj) for obj in shown
         ]
+        payload["objects_shown"] = len(shown)
+        # Explicit, so a model that sees fewer objects than objects_count knows
+        # to reach for blender.get_objects rather than concluding the rest are
+        # missing.
+        payload["objects_truncated"] = len(shown) < len(objects)
     payload["collections"] = [collection.name for collection in bpy.data.collections]
     payload["cameras"] = [obj.name for obj in objects if obj.type == "CAMERA"]
     payload["lights"] = [
@@ -335,6 +363,11 @@ def ping(params: dict[str, Any] | None = None) -> dict[str, Any]:
         "pong": True,
         "blender_version": bpy.app.version_string,
         "scene": bpy.context.scene.name,
+        # Identity, so the server can tell one Blender from another and refuse
+        # a silent takeover. os.getpid is Blender's own process, because the
+        # add-on's Python is Blender's Python.
+        "pid": os.getpid(),
+        "blend_file": bpy.data.filepath or None,
         "time": time.time(),
     }
 
@@ -666,6 +699,60 @@ def render(params: dict[str, Any]) -> dict[str, Any]:
     and a user who has set up Cycles in the UI should not find the scene
     switched to EEVEE because a model rendered a preview.
     """
+    result = _render_now(params)
+    _remember_render(result)
+    return result
+
+
+def render_preview(params: dict[str, Any]) -> dict[str, Any]:
+    """Render small, for a model that wants to look at the result.
+
+    Same machinery as :func:`render` with the size and sample count pinned to
+    something cheap, and the output going to a fixed path so
+    ``blender://render/latest`` always has something to serve.
+    """
+    request = dict(params)
+    request.setdefault("resolution_x", DEFAULT_PREVIEW_RESOLUTION)
+    request.setdefault("resolution_y", DEFAULT_PREVIEW_RESOLUTION)
+    request["resolution_x"] = min(int(request["resolution_x"]), MAX_PREVIEW_RESOLUTION)
+    request["resolution_y"] = min(int(request["resolution_y"]), MAX_PREVIEW_RESOLUTION)
+    if not request.get("samples"):
+        # Without a sample cap a "preview" can cost more than the final render.
+        request["samples"] = DEFAULT_PREVIEW_SAMPLES
+    request["output_path"] = _preview_path()
+    result = _render_now(request)
+    result["preview"] = True
+    _remember_render(result)
+    return result
+
+
+def last_render(_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe the most recent render this add-on performed.
+
+    A render belongs to the file it was made in. Once another file is open the
+    remembered image is not "the latest render" of anything the caller can see,
+    so it is reported as absent rather than served under a caption it does not
+    match.
+    """
+    remembered = _LAST_RENDER["result"]
+    if remembered is not None and remembered.get("blend_file") != (bpy.data.filepath or None):
+        raise ActionError(
+            protocol.OBJECT_NOT_FOUND,
+            f"The last render belongs to {remembered.get('blend_file') or 'an unsaved file'}, "
+            "which is no longer open. Render again to have one here.",
+        )
+    if remembered is None:
+        raise ActionError(
+            protocol.OBJECT_NOT_FOUND,
+            "Nothing has been rendered yet. Call blender.render or blender.render_preview first.",
+        )
+    result = dict(remembered)
+    result["age_seconds"] = _round(time.time() - _LAST_RENDER["at"], 1)
+    result["exists"] = os.path.exists(result.get("output_path", ""))
+    return result
+
+
+def _render_now(params: dict[str, Any]) -> dict[str, Any]:
     scene = bpy.context.scene
     overrides = _render_overrides(scene, params)
     applied = _apply_render_overrides(scene, overrides)
@@ -679,12 +766,14 @@ def render(params: dict[str, Any]) -> dict[str, Any]:
         except RuntimeError as exc:  # Blender raises RuntimeError for render failures
             error = str(exc)
         render_time = time.perf_counter() - started
-        output_path = bpy.path.abspath(scene.render.filepath)
+        # Read while the overrides are still applied, so it describes this render.
+        output_path = _still_output_path(scene)
     finally:
         _restore_render_overrides(scene, overrides)
 
     if error is not None:
         raise ActionError(protocol.BLENDER_OPERATION_FAILED, f"Render failed: {error}")
+
 
     return {
         "success": True,
@@ -693,6 +782,66 @@ def render(params: dict[str, Any]) -> dict[str, Any]:
         "used": applied,
         "settings_restored": True,
     }
+
+
+#: ``image_settings.file_format`` -> the extension Blender actually writes.
+#: ``frame_path()`` is no help here: it appends a frame number, which is right
+#: for an animation and wrong for the single still this renders.
+_FILE_FORMAT_EXTENSIONS = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "OPEN_EXR": ".exr",
+    "TIFF": ".tif",
+    "WEBP": ".webp",
+    "BMP": ".bmp",
+    "TARGA": ".targa",
+    "IRIS": ".iris",
+    "HDR": ".hdr",
+    "AVI_JPEG": ".avi",
+    "FFMPEG": ".mp4",
+}
+
+
+def _still_output_path(scene: Any) -> str:
+    """The file a still render at these settings writes to.
+
+    Blender's rule for ``write_still``: the path is used as given when it already
+    ends in the format's extension, and otherwise the extension is appended. So
+    ``/out/shot`` becomes ``/out/shot.png`` while ``/out/shot.png`` is left alone,
+    and a directory such as ``/out/`` becomes ``/out/.png`` — which is ugly but
+    is what Blender does, and reporting anything else would name a file that is
+    not there.
+    """
+    path = bpy.path.abspath(scene.render.filepath)
+    if not scene.render.use_file_extension:
+        return path
+    suffix = _FILE_FORMAT_EXTENSIONS.get(scene.render.image_settings.file_format, ".png")
+    return path if path.lower().endswith(suffix) else path + suffix
+
+
+def _preview_path() -> str:
+    """Where previews go: a stable name next to Blender's temp directory."""
+    return os.path.join(bpy.app.tempdir, PREVIEW_FILENAME)
+
+
+def forget_render() -> None:
+    """Drop the remembered render.
+
+    Called when Blender loads another file: the picture belongs to the scene that
+    was open when it was made, and serving it as "the latest render" of a
+    different scene is worse than reporting nothing.
+    """
+    _LAST_RENDER["result"] = None
+    _LAST_RENDER["at"] = 0.0
+
+
+def _remember_render(result: dict[str, Any]) -> None:
+    result = dict(result)
+    # Which file this belongs to, so serving it later cannot pass it off as a
+    # render of a different scene.
+    result["blend_file"] = bpy.data.filepath or None
+    _LAST_RENDER["result"] = result
+    _LAST_RENDER["at"] = time.time()
 
 
 def _render_overrides(scene: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -795,12 +944,12 @@ HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     protocol.UPDATE_OBJECT: update_object,
     protocol.DELETE_OBJECT: delete_object,
     protocol.RENDER: render,
+    protocol.RENDER_PREVIEW: render_preview,
+    protocol.LAST_RENDER: last_render,
     protocol.EXECUTE_PYTHON: execute_python,
 }
 
-READ_ONLY_ACTIONS = frozenset(
-    {protocol.GET_SCENE, protocol.GET_OBJECTS, protocol.GET_OBJECT, protocol.PING}
-)
+READ_ONLY_ACTIONS = frozenset({protocol.GET_SCENE, protocol.GET_OBJECTS, protocol.GET_OBJECT, protocol.PING})
 
 
 def dispatch(action: str, params: dict[str, Any]) -> dict[str, Any]:

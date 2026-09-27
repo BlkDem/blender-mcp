@@ -23,7 +23,12 @@ from tests.support.bpy_gate import require_bpy
 bpy = require_bpy()
 
 from blender_mcp import executor, operators  # noqa: E402
-from blender_mcp.connection import TransactionState, _push_undo  # noqa: E402
+from blender_mcp.connection import (  # noqa: E402
+    BlenderConnection,
+    ChangeLog,
+    TransactionState,
+    _push_undo,
+)
 from blender_mcp.protocol import ActionError  # noqa: E402
 
 #: Blender's own default primitive sizes, which this project matches.
@@ -342,7 +347,7 @@ def test_execute_python_rejects_empty_code() -> None:
 # --- transactions and undo ---------------------------------------------------
 
 
-def test_rollback_undoes_every_step_in_a_transaction() -> None:
+def test_rollback_puts_back_what_a_transaction_created() -> None:
     _push_undo("baseline")
     create(type="cube", name="Before")
 
@@ -350,23 +355,132 @@ def test_rollback_undoes_every_step_in_a_transaction() -> None:
     state.begin()
     _push_undo("MCP transaction begin")
     for name in ("InTx1", "InTx2"):
+        state.record([name])
         create(type="cube", name=name)
         state.steps += 1
         _push_undo("MCP create_object")
 
-    assert state.rollback() == 2
+    outcome = state.rollback()
+    assert outcome["restored"] == 2
+    assert outcome["checkpoint"] == "begin"
+    assert outcome["transaction"] == "closed"
+    assert outcome["unrecoverable"] == []
     assert sorted(obj.name for obj in bpy.data.objects) == ["Before"]
     assert state.active is False
+
+
+def test_rollback_puts_back_a_transform_and_a_material() -> None:
+    create(type="cube", name="Edited")
+    bpy.data.objects["Edited"].location = (0, 0, 0)
+
+    state = TransactionState()
+    state.begin()
+    # Both names, because that is what a rename touches: the object as it is now
+    # and the name it is leaving. connection._touched_objects does the same.
+    state.record(["Edited", "Renamed"])
+    obj = bpy.data.objects["Edited"]
+    obj.location = (1, 2, 3)
+    obj.name = "Renamed"
+    state.steps += 1
+
+    state.rollback()
+    assert "Renamed" not in bpy.data.objects
+    restored = bpy.data.objects["Edited"]
+    assert tuple(restored.location) == (0, 0, 0)
+
+
+def test_rollback_removes_an_object_the_transaction_deleted() -> None:
+    create(type="cube", name="Doomed")
+    state = TransactionState()
+    state.begin()
+    state.record(["Doomed"])
+    bpy.data.objects.remove(bpy.data.objects["Doomed"], do_unlink=True)
+
+    state.rollback()
+    assert "Doomed" in bpy.data.objects, "a deleted object should come back"
+
+
+def test_a_checkpoint_unwinds_only_what_came_after_it() -> None:
+    state = TransactionState()
+    state.begin("layout")
+    state.record(["Shell"])
+    create(type="cube", name="Shell")
+    state.checkpoint("shell")
+    state.record(["Detail"])
+    create(type="cube", name="Detail")
+
+    outcome = state.rollback(to="shell")
+    assert outcome["checkpoint"] == "shell"
+    assert outcome["transaction"] == "open", "a partial rewind leaves the transaction usable"
+    assert outcome["checkpoints"] == ["layout", "shell"]
+    names = sorted(obj.name for obj in bpy.data.objects)
+    assert "Shell" in names
+    assert "Detail" not in names
+
+
+def test_a_rename_driven_through_the_bridge_is_rolled_back() -> None:
+    """The whole path, not just the bookkeeping: actions in, scene back as it was."""
+    connection = BlenderConnection("127.0.0.1", 1, auto_reconnect=False)
+    before = set(bpy.data.objects)
+
+    connection.run_action("begin_transaction", {"label": "layout"})
+    connection.run_action("create_object", {"type": "cube", "name": "Box"})
+    connection.run_action(
+        "update_object", {"name": "Box", "new_name": "RenamedBox", "location": [1.0, 2.0, 3.0]}
+    )
+    assert "RenamedBox" in bpy.data.objects
+
+    outcome = connection.run_action("rollback_transaction", {})
+
+    assert outcome["transaction"] == "closed"
+    assert set(bpy.data.objects) == before
+    assert not connection.transaction_open
+
+
+def test_a_checkpoint_driven_through_the_bridge_keeps_earlier_work() -> None:
+    connection = BlenderConnection("127.0.0.1", 1, auto_reconnect=False)
+    connection.run_action("begin_transaction", {"label": "layout"})
+    connection.run_action("create_object", {"type": "cube", "name": "Shell"})
+    connection.run_action("checkpoint", {"label": "shell"})
+    connection.run_action("create_object", {"type": "cube", "name": "Detail"})
+
+    outcome = connection.run_action("rollback_transaction", {"to": "shell"})
+
+    assert outcome["checkpoints"] == ["layout", "shell"]
+    assert "Shell" in bpy.data.objects
+    assert "Detail" not in bpy.data.objects
+    assert connection.transaction_open, "work continues from the checkpoint"
+    connection.run_action("commit_transaction", {})
+
+
+def test_a_duplicate_checkpoint_label_is_refused() -> None:
+    state = TransactionState()
+    state.begin()
+    state.checkpoint("shell")
+    with pytest.raises(ActionError) as excinfo:
+        state.checkpoint("shell")
+    assert excinfo.value.code == "INVALID_PARAMETER"
+
+
+def test_rolling_back_to_an_unknown_checkpoint_is_refused() -> None:
+    state = TransactionState()
+    state.begin("layout")
+    with pytest.raises(ActionError) as excinfo:
+        state.rollback("nowhere")
+    assert excinfo.value.code == "INVALID_PARAMETER"
+    assert "layout" in excinfo.value.message
 
 
 def test_commit_keeps_the_changes() -> None:
     state = TransactionState()
     state.begin()
     _push_undo("begin")
+    state.record(["Kept"])
     create(type="cube", name="Kept")
     state.steps += 1
     assert state.commit() == 1
     assert "Kept" in bpy.data.objects
+    assert state.checkpoints == []
 
 
 def test_nesting_a_transaction_is_refused() -> None:
@@ -381,6 +495,42 @@ def test_rollback_without_a_transaction_is_refused() -> None:
     with pytest.raises(ActionError) as excinfo:
         TransactionState().rollback()
     assert excinfo.value.code == "TRANSACTION_NOT_ACTIVE"
+
+
+def test_a_checkpoint_without_a_transaction_is_refused() -> None:
+    with pytest.raises(ActionError) as excinfo:
+        TransactionState().checkpoint("shell")
+    assert excinfo.value.code == "TRANSACTION_NOT_ACTIVE"
+
+
+# --- change log --------------------------------------------------------------
+
+
+def test_the_change_log_counts_and_reports_names() -> None:
+    log = ChangeLog()
+    log.record("update_object", ["Cube"])
+    log.record("manual", ["Sphere"])
+    assert log.count == 2
+    assert log.since(0)["changes"][0] == {"index": 0, "action": "update_object", "names": ["Cube"]}
+    assert [entry["index"] for entry in log.since(1)["changes"]] == [1]
+
+
+def test_the_change_log_coalesces_a_drag() -> None:
+    """A drag fires the depsgraph handler continuously; that is one change."""
+    log = ChangeLog()
+    log.record("manual", ["Cube"])
+    log.record("manual", ["Cube"])
+    assert log.count == 1
+
+
+def test_the_change_log_says_when_it_forgot() -> None:
+    log = ChangeLog()
+    for index in range(ChangeLog.CAPACITY + 5):
+        log.record("update_object", [f"Obj{index}"])
+    report = log.since(0)
+    assert report["count"] == ChangeLog.CAPACITY + 5
+    assert report["dropped"] == 5, "a waiter must be told its baseline fell out of the window"
+    assert len(report["changes"]) == ChangeLog.CAPACITY
 
 
 # --- render ------------------------------------------------------------------

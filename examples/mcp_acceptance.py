@@ -44,6 +44,21 @@ class Client:
             raise RuntimeError(f"{name} -> {tail}")
         return result.structured_content
 
+    async def call_blocks(self, name: str, arguments: dict | None = None) -> list:
+        """For the tools that answer with content blocks rather than one JSON object.
+
+        ``render_preview`` and ``wait_for_change`` return a JSON summary plus
+        whatever images they have, which is not a single structured object.
+        """
+        result = await self.session.call_tool(name, arguments or {})
+        if result.is_error:
+            _, _, tail = result.content[0].text.partition(": ")
+            raise RuntimeError(f"{name} -> {tail}")
+        return result.content
+
+    async def read_resource(self, uri: str):
+        return await self.session.read_resource(uri)
+
     async def expect_error(self, name: str, arguments: dict | None = None) -> str:
         result = await self.session.call_tool(name, arguments or {})
         if not result.is_error:
@@ -88,8 +103,8 @@ async def run(options: argparse.Namespace) -> None:
             )
             uris = {str(r.uri) for r in (await session.list_resources()).resources}
             check(
-                "both resources are registered",
-                uris == {"blender://scene", "blender://objects"},
+                "every resource is registered",
+                uris == {"blender://scene", "blender://objects", "blender://render/latest"},
                 sorted(uris),
             )
 
@@ -305,12 +320,47 @@ async def run(options: argparse.Namespace) -> None:
                 == "OBJECT_NOT_FOUND",
             )
 
-            print("\n14. a transaction is undoable", flush=True)
+            print("\n14. render_preview returns a picture", flush=True)
+            preview = await client.call_blocks(
+                "blender.render_preview", {"max_edge": 64, "engine": "CYCLES", "samples": 1}
+            )
+            check(
+                "the preview is an image block",
+                any(getattr(block, "type", None) == "image" for block in preview),
+                [getattr(b, "type", None) for b in preview],
+            )
+            latest = await client.read_resource("blender://render/latest")
+            check("the last render is served as bytes", bool(latest.contents[0].blob))
+
+            print("\n15. waiting for a change", flush=True)
+            still = await client.call_blocks("blender.wait_for_change", {"timeout": 0.5})
+            check("a quiet scene answers no", json.loads(still[0].text)["changed"] is False)
+
+            print("\n16. a transaction is undoable", flush=True)
             await client.call("blender.begin_transaction")
             for index in range(3):
                 await client.call("blender.create_object", {"type": "cylinder", "name": f"Leg{index}"})
             committed = await client.call("blender.commit_transaction")
             check("undo steps were recorded", committed["undo_steps"] == 3, committed)
+
+            print("\n17. a checkpoint unwinds one stage", flush=True)
+            await client.call("blender.begin_transaction", {"label": "layout"})
+            await client.call("blender.create_object", {"type": "cube", "name": "Shell"})
+            marked = await client.call("blender.checkpoint", {"label": "shell"})
+            check("the checkpoint is named", marked["checkpoints"] == ["layout", "shell"], marked)
+            await client.call("blender.create_object", {"type": "cube", "name": "Detail"})
+            rolled = await client.call("blender.rollback_transaction", {"to": "shell"})
+            after = await client.call("blender.get_objects", {"limit": 50})
+            names = {entry["name"] for entry in after["objects"]}
+            check("the detail is gone", "Detail" not in names, sorted(names))
+            check("the shell stayed", "Shell" in names, sorted(names))
+            check("the transaction is still open", rolled["transaction"] == "open", rolled)
+            await client.call("blender.commit_transaction")
+
+            print("\n18. the instances registry", flush=True)
+            listed = await client.call("blender.get_instances", {})
+            check("one instance is active", listed["active"]["status"] == "active", listed["active"])
+            check("takeover is off by default", listed["takeover_allowed"] is False)
 
 
 def main() -> int:
@@ -337,8 +387,11 @@ def main() -> int:
             options.blender_arg,
             env={
                 **os.environ,
-                "BLENDER_ATTACH_HOST": "127.0.0.1",
-                "BLENDER_ATTACH_PORT": str(options.port),
+                # An existing value wins: a Blender on the other side of a
+                # boundary — a Windows Blender reaching a server in WSL, say —
+                # cannot use loopback, and the operator is the one who knows.
+                "BLENDER_ATTACH_HOST": os.environ.get("BLENDER_ATTACH_HOST", "127.0.0.1"),
+                "BLENDER_ATTACH_PORT": os.environ.get("BLENDER_ATTACH_PORT", str(options.port)),
                 "BLENDER_ATTACH_SECONDS": str(options.blender_seconds),
             },
         )

@@ -120,12 +120,16 @@ def test_mutation_classification_covers_every_write_action() -> None:
         Action.UPDATE_OBJECT,
         Action.DELETE_OBJECT,
         Action.RENDER,
+        Action.RENDER_PREVIEW,
         Action.EXECUTE_PYTHON,
         Action.BEGIN_TRANSACTION,
+        Action.CHECKPOINT,
         Action.COMMIT_TRANSACTION,
         Action.ROLLBACK_TRANSACTION,
     }
     assert not Action.GET_SCENE.is_mutation
+    assert not Action.CHANGE_COUNT.is_mutation
+    assert not Action.CHANGES.is_mutation
 
 
 def test_error_info_round_trips() -> None:

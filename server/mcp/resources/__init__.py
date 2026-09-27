@@ -14,7 +14,7 @@ from __future__ import annotations
 from mcp.server.mcpserver import MCPServer
 
 from server.blender.connection import BlenderBridge
-from server.mcp.resources import objects, scene
+from server.mcp.resources import objects, render, scene
 
 __all__ = ["register_resources"]
 
@@ -23,3 +23,4 @@ def register_resources(server: MCPServer, bridge: BlenderBridge) -> None:
     """Register every ``blender://`` resource on ``server``."""
     scene.register(server, bridge)
     objects.register(server, bridge)
+    render.register(server, bridge)
