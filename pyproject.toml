@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blender-mcp-server"
+version = "0.1.0"
+description = "MCP server that lets AI clients drive a running Blender instance over a WebSocket bridge"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Blender MCP contributors" }]
+keywords = ["mcp", "blender", "bpy", "ai", "llm", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+dependencies = [
+    "mcp>=2.2,<3",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "websockets>=14",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[project.scripts]
+blender-mcp-server = "server.main:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/blender-mcp"
+Issues = "https://github.com/your-org/blender-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server"]
+
+[tool.hatch.build.targets.sdist]
+include = ["server", "addon", "tests", "examples", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# A deprecated MCP API call should fail the build, not pass quietly.
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["addon"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"server/mcp/tools/*.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+exclude = ["^addon/"]
