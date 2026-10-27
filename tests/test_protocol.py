@@ -126,6 +126,9 @@ def test_mutation_classification_covers_every_write_action() -> None:
         Action.CHECKPOINT,
         Action.COMMIT_TRANSACTION,
         Action.ROLLBACK_TRANSACTION,
+        Action.CREATE_HUMAN,
+        Action.UPDATE_HUMAN,
+        Action.ADD_HUMAN_LOD,
     }
     assert not Action.GET_SCENE.is_mutation
     assert not Action.CHANGE_COUNT.is_mutation

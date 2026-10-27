@@ -44,6 +44,11 @@ class Action(StrEnum):
     CHECKPOINT = "checkpoint"
     COMMIT_TRANSACTION = "commit_transaction"
     ROLLBACK_TRANSACTION = "rollback_transaction"
+    # humans, through MPFB
+    GET_HUMAN_OPTIONS = "get_human_options"
+    CREATE_HUMAN = "create_human"
+    UPDATE_HUMAN = "update_human"
+    ADD_HUMAN_LOD = "add_human_lod"
 
     @property
     def is_mutation(self) -> bool:
@@ -62,6 +67,9 @@ _MUTATING_ACTIONS = frozenset(
         Action.CHECKPOINT,
         Action.COMMIT_TRANSACTION,
         Action.ROLLBACK_TRANSACTION,
+        Action.CREATE_HUMAN,
+        Action.UPDATE_HUMAN,
+        Action.ADD_HUMAN_LOD,
     }
 )
 

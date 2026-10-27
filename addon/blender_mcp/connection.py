@@ -107,6 +107,10 @@ class ObjectState:
             obj = bpy.data.objects.get(self.name)
             if obj is None:
                 return True  # already gone, which is the state we wanted
+            # Its children go with it: they were made with it -- a human's eyes
+            # and brows are -- and left behind they float where it used to be.
+            for child in list(obj.children_recursive):
+                bpy.data.objects.remove(child, do_unlink=True)
             bpy.data.objects.remove(obj, do_unlink=True)
             return True
 
@@ -201,7 +205,15 @@ _TOUCHED_BY_ACTION: dict[str, tuple[str, ...]] = {
     protocol.CREATE_OBJECT: ("name",),
     protocol.UPDATE_OBJECT: ("name", "new_name"),
     protocol.DELETE_OBJECT: ("name",),
+    protocol.CREATE_HUMAN: ("name",),
+    protocol.UPDATE_HUMAN: ("name",),
+    protocol.ADD_HUMAN_LOD: ("name",),
 }
+
+#: How many ``<name>_LOD<n>`` copies an ``add_human_lod`` call makes, so they are
+#: recorded as absent before they exist and a rollback removes them again.
+#: Kept in step with :func:`blender_mcp.humans.lod_names`.
+_LOD_SUFFIX = "_LOD"
 
 
 def _touched_objects(action: str, params: dict[str, Any]) -> list[str]:
@@ -215,6 +227,10 @@ def _touched_objects(action: str, params: dict[str, Any]) -> list[str]:
         value = params.get(field)
         if isinstance(value, str) and value:
             names.append(value)
+    if action == protocol.ADD_HUMAN_LOD and isinstance(params.get("name"), str):
+        ratios = params.get("low_ratios")
+        count = len(ratios) if isinstance(ratios, list) else 0
+        names.extend(f"{params['name']}{_LOD_SUFFIX}{index}" for index in range(1, count + 1))
     return names
 
 

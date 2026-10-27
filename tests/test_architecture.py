@@ -20,7 +20,7 @@ SERVER_DIR = ROOT / "server"
 ADDON_PACKAGE = ADDON_DIR / "blender_mcp"
 
 #: Add-on modules that must stay importable without Blender on the path.
-BLENDER_FREE_ADDON_MODULES = ("protocol.py", "websocket.py")
+BLENDER_FREE_ADDON_MODULES = ("protocol.py", "websocket.py", "humans_catalog.py")
 
 
 def python_files(root: Path) -> list[Path]:
@@ -92,7 +92,7 @@ def test_blender_free_modules_import_without_bpy(name: str) -> None:
 def test_only_the_expected_addon_modules_import_bpy() -> None:
     """``__init__.py`` is bpy-free on purpose: it defers its imports to register()."""
     importing = {path.name for path in python_files(ADDON_PACKAGE) if "bpy" in imported_modules(path)}
-    assert importing == {"connection.py", "executor.py", "operators.py", "ui.py"}
+    assert importing == {"connection.py", "executor.py", "humans.py", "operators.py", "ui.py"}
 
 
 def test_the_addon_declares_bl_info() -> None:

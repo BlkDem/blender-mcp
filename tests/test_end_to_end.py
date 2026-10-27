@@ -137,6 +137,10 @@ async def test_the_tool_list_is_what_the_brief_asks_for() -> None:
         "blender.begin_transaction",
         "blender.commit_transaction",
         "blender.rollback_transaction",
+        "blender.get_human_options",
+        "blender.create_human",
+        "blender.update_human",
+        "blender.add_human_lod",
     }
 
 

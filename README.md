@@ -437,7 +437,7 @@ thing, headless:
 
 ```bash
 pip install bpy==4.2.0
-pytest                          # 437 tests: 338 + 99 against real bpy
+pytest                          # 387 tests without bpy, plus 99 against real bpy
 BLENDER_MCP_SKIP_BPY=1 pytest   # 295, opt the real-Blender ones back out
 ```
 
@@ -499,6 +499,44 @@ needs the GUI event loop. The tests call the dispatch function directly instead
 | `blender.render_preview` | — | `max_edge`, `engine`, `samples`, `include_image` | Small render, returned as an image |
 | `blender.wait_for_change` | — | `timeout`, `objects`, `include_image` | Wait until something changes, or time out |
 | `blender.execute_python` | `code` | — | Run Python inside Blender; a power-user escape hatch, not the normal path |
+
+### Humans
+
+Realistic human bodies, built with [MPFB](https://static.makehumancommunity.org/mpfb.html)
+(MakeHuman for Blender) inside the connected Blender. A model describes the body
+— sex, age in years, height in metres, how muscular and how heavy — and the
+add-on builds it with skin, eyes and brows.
+
+| Tool | Required | Optional | What it does |
+|---|---|---|---|
+| `blender.get_human_options` | — | `section` | Whether MPFB and its assets are installed; skins, parts, target categories |
+| `blender.create_human` | `name` | `location`, `gender`, `age_years`, `height_m`, `muscle`, `weight`, `proportions`, `cupsize`, `firmness`, `race`, `targets`, `skin`, `skin_type`, `eyes`, `eyebrows`, `eyelashes`, `hair` | Build a human from a description |
+| `blender.update_human` | `name` | the same, minus `location` | Change only what is given; parts are refitted |
+| `blender.add_human_lod` | `name` | `subdivision_levels`, `low_ratios`, `spacing_m` | Multires detail on the body, decimated copies beside it |
+
+Setting it up, in the Blender the add-on runs in:
+
+1. **Edit → Preferences → Get Extensions**, search *MPFB*, install it, and make
+   sure it is ticked under **Add-ons**. The tools never enable it themselves;
+   without it they answer `HUMAN_GENERATOR_UNAVAILABLE`.
+2. Download the [MakeHuman system assets](https://static.makehumancommunity.org/assets/assetpacks/makehuman_system_assets.html)
+   zip and install it from the 3D view sidebar: **MPFB tab → Start here →
+   Install pack from zip**. Without it a body is built bare, and asking for a
+   skin or a part answers `HUMAN_ASSETS_MISSING`.
+
+`targets` is MPFB's fine shaping, by category: `{"nose-volume-decr-incr": 0.4}`.
+A category with two directions takes −1..1 (negative is the first word), one
+with a single shape 0..1; `get_human_options(section="nose")` lists a section's
+categories. `skin: "auto"` (the default) picks a skin by sex, age and race, and
+picks again when those change. A rollback undoes a created human, its parts and
+its LOD copies, but not a shape change made by `update_human`.
+
+`examples/human_check.py` builds a line-up of humans through the add-on and
+renders it, for checking the result by eye:
+
+```bash
+blender --background --python examples/human_check.py -- --out ~/human-check
+```
 
 ### Undo grouping
 
@@ -824,6 +862,8 @@ Failures are structured, with a stable `error.code` to branch on:
 | `TRANSACTION_ACTIVE` | A transaction is already open |
 | `TRANSACTION_NOT_ACTIVE` | Commit or rollback without a `begin` |
 | `INTERNAL_ERROR` | Anything unclassified |
+| `HUMAN_GENERATOR_UNAVAILABLE` | MPFB is not installed or not enabled in this Blender |
+| `HUMAN_ASSETS_MISSING` | A skin or part was asked for without the MakeHuman asset pack |
 
 Tracebacks are logged on the server and in Blender's console; the model gets the
 exception type, message and a short traceback tail, which is what it needs to
@@ -880,9 +920,14 @@ Error:
 | `checkpoint` | write | `label` |
 | `commit_transaction` | write | — |
 | `rollback_transaction` | write | `to` |
+| `get_human_options` | read | `section` |
+| `create_human` | write | `name` + body, skin and part fields (see [Humans](#humans)) |
+| `update_human` | write | `name` + any body, skin or part field |
+| `add_human_lod` | write | `name`, `subdivision_levels`, `low_ratios`, `spacing_m` |
 
 "write" means it pushes an undo step. Adding an action means adding an entry
-here, a handler in `addon/blender_mcp/operators.py`, and — if the model should
+here, a handler in `addon/blender_mcp/operators.py` (the human actions live in
+`addon/blender_mcp/humans.py`), and — if the model should
 see it — a tool in `server/mcp/tools/`. The two protocol modules mirror each
 other field for field, and `tests/test_addon_protocol.py` fails if they drift.
 
@@ -1138,10 +1183,12 @@ blender-mcp/
 │   ├── websocket.py             # minimal RFC 6455 client (no dependencies)
 │   ├── connection.py            # socket thread, reconnect, main-thread dispatch
 │   ├── operators.py             # every bpy operation
+│   ├── humans.py                # human characters, through MPFB
+│   ├── humans_catalog.py        # their arithmetic: ages, targets, skins (no bpy)
 │   ├── executor.py              # executes model-written code
 │   └── ui.py                    # N-panel and its operators
 │
-├── tests/                       # pytest; 437 tests (338 without bpy)
+├── tests/                       # pytest; 387 tests without bpy, 99 more with it
 │   └── support/                 # protocol double, stubs, the bpy gate
 │
 ├── examples/                    # bridge scripts, acceptance checks, GUI demo

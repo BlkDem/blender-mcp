@@ -34,6 +34,10 @@ blender.update_object / blender.delete_object, then blender.render to check the
 result. Wrap a multi-object build in blender.begin_transaction so a mistake can
 be undone with a single blender.rollback_transaction.
 
+For a person or character, use blender.create_human (check
+blender.get_human_options first) rather than assembling primitives: it builds a
+realistic body with skin, eyes and brows from a description.
+
 Units are metres and rotations are DEGREES on every tool. Tools return small
 JSON summaries; use blender.execute_python when you need something the tools do
 not cover.

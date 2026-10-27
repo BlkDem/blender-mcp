@@ -774,7 +774,6 @@ def _render_now(params: dict[str, Any]) -> dict[str, Any]:
     if error is not None:
         raise ActionError(protocol.BLENDER_OPERATION_FAILED, f"Render failed: {error}")
 
-
     return {
         "success": True,
         "output_path": output_path,
@@ -949,15 +948,37 @@ HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     protocol.EXECUTE_PYTHON: execute_python,
 }
 
-READ_ONLY_ACTIONS = frozenset({protocol.GET_SCENE, protocol.GET_OBJECTS, protocol.GET_OBJECT, protocol.PING})
+READ_ONLY_ACTIONS = frozenset(
+    {protocol.GET_SCENE, protocol.GET_OBJECTS, protocol.GET_OBJECT, protocol.PING, protocol.GET_HUMAN_OPTIONS}
+)
+
+#: Served by :mod:`blender_mcp.humans`, listed here so an unknown action's error
+#: names them without importing that module.
+HUMAN_ACTIONS = (
+    protocol.GET_HUMAN_OPTIONS,
+    protocol.CREATE_HUMAN,
+    protocol.UPDATE_HUMAN,
+    protocol.ADD_HUMAN_LOD,
+)
+
+
+def _human_handler(action: str) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+    """The human actions, imported on first use.
+
+    They live in their own module because MPFB is a separate extension: nothing
+    about it should load, or fail to load, until a human is actually asked for.
+    """
+    from blender_mcp import humans
+
+    return humans.HANDLERS.get(action)
 
 
 def dispatch(action: str, params: dict[str, Any]) -> dict[str, Any]:
     """Route one action to its handler."""
-    handler = HANDLERS.get(action)
+    handler = HANDLERS.get(action) or (_human_handler(action) if action in HUMAN_ACTIONS else None)
     if handler is None:
         raise ActionError(
             protocol.UNKNOWN_ACTION,
-            f"Unknown action '{action}'. Supported: {', '.join(sorted(HANDLERS))}",
+            f"Unknown action '{action}'. Supported: {', '.join(sorted([*HANDLERS, *HUMAN_ACTIONS]))}",
         )
     return handler(params)

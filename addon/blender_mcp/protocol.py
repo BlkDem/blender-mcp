@@ -36,6 +36,10 @@ BEGIN_TRANSACTION = "begin_transaction"
 CHECKPOINT = "checkpoint"
 COMMIT_TRANSACTION = "commit_transaction"
 ROLLBACK_TRANSACTION = "rollback_transaction"
+GET_HUMAN_OPTIONS = "get_human_options"
+CREATE_HUMAN = "create_human"
+UPDATE_HUMAN = "update_human"
+ADD_HUMAN_LOD = "add_human_lod"
 
 #: Actions that change the scene and therefore push an undo step.
 MUTATING_ACTIONS = frozenset(
@@ -50,6 +54,9 @@ MUTATING_ACTIONS = frozenset(
         CHECKPOINT,
         COMMIT_TRANSACTION,
         ROLLBACK_TRANSACTION,
+        CREATE_HUMAN,
+        UPDATE_HUMAN,
+        ADD_HUMAN_LOD,
     }
 )
 
@@ -70,6 +77,8 @@ UNKNOWN_ACTION = "UNKNOWN_ACTION"
 TRANSACTION_ACTIVE = "TRANSACTION_ACTIVE"
 TRANSACTION_NOT_ACTIVE = "TRANSACTION_NOT_ACTIVE"
 INTERNAL_ERROR = "INTERNAL_ERROR"
+HUMAN_GENERATOR_UNAVAILABLE = "HUMAN_GENERATOR_UNAVAILABLE"
+HUMAN_ASSETS_MISSING = "HUMAN_ASSETS_MISSING"
 
 ERROR_CODES = frozenset(
     {
@@ -89,6 +98,8 @@ ERROR_CODES = frozenset(
         TRANSACTION_ACTIVE,
         TRANSACTION_NOT_ACTIVE,
         INTERNAL_ERROR,
+        HUMAN_GENERATOR_UNAVAILABLE,
+        HUMAN_ASSETS_MISSING,
     }
 )
 

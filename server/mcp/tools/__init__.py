@@ -12,6 +12,7 @@ from collections.abc import Callable
 from mcp.server.mcpserver import MCPServer
 
 from server.mcp.tools import (
+    humans,
     instances,
     objects,
     preview,
@@ -45,6 +46,7 @@ def register_tools(server: MCPServer, enabled: Callable[[str], bool] | None = No
         transactions.register_tools,
         watch.register_tools,
         instances.register_tools,
+        humans.register_tools,
     ):
         skipped.extend(register(server, allow))
 

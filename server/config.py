@@ -35,6 +35,10 @@ KNOWN_TOOLS: tuple[str, ...] = (
     "blender.checkpoint",
     "blender.commit_transaction",
     "blender.rollback_transaction",
+    "blender.get_human_options",
+    "blender.create_human",
+    "blender.update_human",
+    "blender.add_human_lod",
 )
 
 #: Names that are always registered, whatever the allowlist says: without them
